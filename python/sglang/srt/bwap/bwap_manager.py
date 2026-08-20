@@ -223,9 +223,12 @@ class BWAPManager:
 
         # Phase-2a fused-forward state (keyed by act_fn name).
         self._fast_ok: Dict[str, bool] = {}  # layer eligible for the gather path
-        self._gate_up_k: Dict[str, torch.Tensor] = {}  # gathered gate+up rows
-        self._down_k: Dict[str, torch.Tensor] = {}  # gathered down columns
-        self._gathered_version: Dict[str, int] = {}  # mask_version the gather reflects
+        # Fixed-address gathered-weight buffers (allocated once at the fixed size
+        # k=(1-sparsity)*D_ff, refreshed in place with copy_). Stable pointers so a
+        # captured CUDA graph reads the same address every replay (Phase 2b).
+        self._gate_up_buf: Dict[str, torch.Tensor] = {}  # [2k, hidden] gate+up rows
+        self._down_buf: Dict[str, torch.Tensor] = {}  # [hidden, k] down columns
+        self._gathered_version: Dict[str, int] = {}  # mask_version the buffers reflect
         self._orig_forwards: Dict[str, Callable] = {}  # saved mlp.forward for teardown
 
         # Row-step accounting for realized_sparsity (a row-step is one request
@@ -419,6 +422,10 @@ class BWAPManager:
                 self._phase is _Phase.DECODE
                 and self._all_prune
                 and self._fast_ok.get(name, False)
+                # Only fast-path once a real top-k mask exists: its support is
+                # exactly k=(1-sparsity)*D_ff, which keeps the gathered buffers a
+                # fixed size (the all-ones warmup mask would be full-width).
+                and self.mem_scores.get(name) is not None
             ):
                 return self._fast_mlp_forward(name, mlp, x)
             return orig(x, *args, **kwargs)
@@ -429,13 +436,17 @@ class BWAPManager:
         self, name: str, mlp: torch.nn.Module, x: torch.Tensor
     ) -> torch.Tensor:
         weight = mlp.down_proj.weight
-        d_ff = self._materialize_mask(name, weight.shape[1], weight.device).shape[0]
+        d_ff = weight.shape[1]
+        self._materialize_mask(name, d_ff, weight.device)
         if self._gathered_version.get(name) != self.mask_version.get(name):
             keep_idx = self.masks[name].bool().nonzero(as_tuple=False).squeeze(-1)
             gate_up_k, down_k = gather_ffn_weights(
                 mlp.gate_up_proj.weight, weight, keep_idx, d_ff
             )
-            self._gate_up_k[name] = gate_up_k.to(x.dtype)
-            self._down_k[name] = down_k.to(x.dtype)
+            if name not in self._gate_up_buf:  # allocate fixed-address buffers once
+                self._gate_up_buf[name] = torch.empty_like(gate_up_k, dtype=x.dtype)
+                self._down_buf[name] = torch.empty_like(down_k, dtype=x.dtype)
+            self._gate_up_buf[name].copy_(gate_up_k)  # refresh in place (stable ptr)
+            self._down_buf[name].copy_(down_k)
             self._gathered_version[name] = self.mask_version.get(name, 0)
-        return fused_pruned_mlp(x, self._gate_up_k[name], self._down_k[name])
+        return fused_pruned_mlp(x, self._gate_up_buf[name], self._down_buf[name])

@@ -328,6 +328,36 @@ class TestBWAPFused(CustomTestCase):
         y_ref = F.linear(silu_and_mul(F.linear(x, gu_w)) * mask, dn_w)  # masked dense
         torch.testing.assert_close(y_fused, y_ref, rtol=1e-4, atol=1e-5)
 
+    def test_gathered_buffers_keep_stable_address_across_refresh(self):
+        # Capture-readiness (Phase 2b): the gathered-weight buffers must refresh
+        # in place (copy_), never be reassigned — a captured CUDA graph replays
+        # against a fixed pointer. Guards a regression back to per-refresh alloc.
+        model = TinyModel()
+        mgr = BWAPManager(
+            base_model=model,
+            sparsity=0.5,
+            t_init=2,
+            t_explore=1,
+            t_prune=2,
+            fused=True,
+            tp_size=1,
+        )
+        key = next(iter(mgr.gated_mlps))
+        mlp = mgr.gated_mlps[key]
+        x = torch.randn(4, HIDDEN)
+
+        mgr._update_mem(key, torch.rand(INTERMEDIATE))  # first mask
+        mgr._fast_mlp_forward(key, mlp, x)  # allocates the fixed buffers
+        buf_gu, buf_dn = mgr._gate_up_buf[key], mgr._down_buf[key]
+        ptr_gu, ptr_dn = buf_gu.data_ptr(), buf_dn.data_ptr()
+
+        mgr._update_mem(key, torch.rand(INTERMEDIATE) * 5)  # different mask -> refresh
+        mgr._fast_mlp_forward(key, mlp, x)
+        self.assertIs(mgr._gate_up_buf[key], buf_gu)  # same tensor object
+        self.assertIs(mgr._down_buf[key], buf_dn)
+        self.assertEqual(mgr._gate_up_buf[key].data_ptr(), ptr_gu)  # same address
+        self.assertEqual(mgr._down_buf[key].data_ptr(), ptr_dn)
+
 
 if __name__ == "__main__":
     unittest.main()
