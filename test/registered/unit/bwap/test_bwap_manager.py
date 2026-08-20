@@ -17,8 +17,15 @@
 import unittest
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.bwap.bwap_fused import (
+    fast_path_eligible,
+    fused_pruned_mlp,
+    gather_ffn_weights,
+    silu_and_mul,
+)
 from sglang.srt.bwap.bwap_manager import (
     BWAPManager,
     build_topk_mask,
@@ -250,6 +257,76 @@ class TestBWAPHookIntegration(CustomTestCase):
         manager._update_mem("mlp.act_fn", scores.flip(0) * 2)
         mask2 = manager._get_mask("mlp.act_fn", z)
         self.assertFalse(torch.equal(mask1, mask2))
+
+
+class TestBWAPFused(CustomTestCase):
+    def test_gather_ffn_parity(self):
+        # Derived property: the gather-GEMM equals the masked dense FFN. Uses
+        # realistic (1/sqrt(fan_in)) init so activations are O(1) and fp reorder
+        # is the only difference.
+        torch.manual_seed(0)
+        hid, d_ff, k = 32, 96, 48
+        gate_up_w = torch.randn(2 * d_ff, hid) / hid**0.5
+        down_w = torch.randn(hid, d_ff) / d_ff**0.5
+        x = torch.randn(4, hid)
+        keep = torch.topk(torch.rand(d_ff), k).indices.sort().values
+        mask = torch.zeros(d_ff)
+        mask[keep] = 1.0
+
+        y_dense = F.linear(silu_and_mul(F.linear(x, gate_up_w)) * mask, down_w)
+        gate_up_k, down_k = gather_ffn_weights(gate_up_w, down_w, keep, d_ff)
+        y_fused = fused_pruned_mlp(x, gate_up_k, down_k)
+        torch.testing.assert_close(y_dense, y_fused, rtol=1e-5, atol=1e-6)
+
+    def test_eligibility_guards(self):
+        model = TinyModel()
+        gu, dn = model.mlp.gate_up_proj, model.mlp.down_proj
+        self.assertTrue(fast_path_eligible(gu, dn, tp_size=1))  # bias-free float, TP=1
+        self.assertFalse(fast_path_eligible(gu, dn, tp_size=2))  # TP>1 needs a reduce
+        biased = nn.Linear(HIDDEN, INTERMEDIATE, bias=True)
+        self.assertFalse(fast_path_eligible(biased, dn, tp_size=1))  # bias unsupported
+
+    def test_fused_forward_equals_masked_dense(self):
+        # Bug regression + derived property: with --bwap-fused, an all-prune
+        # decode step must return the SAME output as the Phase-1 masked dense
+        # path (the fused path is a pure-perf refactor, not a behavior change).
+        model = TinyModel()
+        x = torch.randn(4, HIDDEN)
+        mgr = BWAPManager(
+            base_model=model,
+            sparsity=0.5,
+            t_init=2,
+            t_explore=1,
+            t_prune=2,
+            fused=True,
+            tp_size=1,
+        )
+        mgr.register_hooks()
+        mgr.install_fused_forwards()
+        try:
+            self.assertTrue(all(mgr._fast_ok.values()))  # TinyGatedMLP is eligible
+            _extend(mgr, req_ids=[0, 1, 2, 3])
+            with torch.no_grad():
+                model(x)  # prompt: collect s0
+            for step in range(2):  # T_init explore steps: collect, dense forward
+                _decode(mgr, req_ids=[0, 1, 2, 3], seq_lens=[5 + step] * 4)
+                with torch.no_grad():
+                    model(x)
+            # step 2 -> all-prune: the wrapper takes the gather-GEMM fast path
+            _decode(mgr, req_ids=[0, 1, 2, 3], seq_lens=[7] * 4)
+            self.assertTrue(mgr._all_prune)
+            with torch.no_grad():
+                y_fused = model(x)
+        finally:
+            mgr.remove_fused_forwards()
+            mgr.remove_hooks()
+
+        key = next(iter(mgr.gated_mlps))
+        mask = mgr.masks[key]
+        self.assertEqual(int(mask.sum().item()), INTERMEDIATE // 2)  # real top-k
+        gu_w, dn_w = model.mlp.gate_up_proj.weight, model.mlp.down_proj.weight
+        y_ref = F.linear(silu_and_mul(F.linear(x, gu_w)) * mask, dn_w)  # masked dense
+        torch.testing.assert_close(y_fused, y_ref, rtol=1e-4, atol=1e-5)
 
 
 if __name__ == "__main__":

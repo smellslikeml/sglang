@@ -3012,6 +3012,11 @@ class ServerArgs:
         "Number of sparse (pruned) decode steps per BWAP refresh cycle (T_p). The full cycle is T_trans = T_E + T_p.",
         NS("bwap"),
     ] = 16
+    bwap_fused: A[
+        bool,
+        "Phase-2a: on all-prune decode steps, compute only the retained neurons via a gather-GEMM (real FFN speedup) instead of masking the full activation. Falls back to the masked path for quantized weights, TP>1, or mixed-phase batches. Requires --enable-bwap.",
+        NS("bwap"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Two batch overlap
@@ -9583,12 +9588,16 @@ class ServerArgs:
         if not self.enable_bwap:
             return
 
-        assert (
-            0.0 <= self.bwap_sparsity < 1.0
-        ), "--bwap-sparsity must be in [0, 1)."
+        assert 0.0 <= self.bwap_sparsity < 1.0, "--bwap-sparsity must be in [0, 1)."
         assert self.bwap_t_init >= 0, "--bwap-t-init must be non-negative."
         assert self.bwap_t_explore >= 1, "--bwap-t-explore must be positive."
         assert self.bwap_t_prune >= 1, "--bwap-t-prune must be positive."
+        if self.bwap_fused and self.tp_size > 1:
+            logger.warning(
+                "--bwap-fused gather-GEMM is TP=1 only for now; with tp_size>1 "
+                "every layer falls back to the masked path (no speedup). "
+                "TP row-parallel gather is a follow-up."
+            )
 
         if self.cuda_graph_config.decode.backend != Backend.DISABLED:
             logger.warning(

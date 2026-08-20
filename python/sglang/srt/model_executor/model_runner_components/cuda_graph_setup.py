@@ -200,6 +200,8 @@ def capture_cuda_graphs(
     # BWAP pruning hooks follow the same rule: post-capture, eager-path only.
     if model_runner.bwap_manager is not None:
         model_runner.bwap_manager.register_hooks()
+        if model_runner.server_args.bwap_fused:
+            model_runner.bwap_manager.install_fused_forwards()
 
     prealloc_symmetric_memory_pool(
         is_draft_worker=model_runner.is_draft_worker,

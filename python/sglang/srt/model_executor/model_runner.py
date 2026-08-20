@@ -25,6 +25,7 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.bwap.bwap_manager import BWAPManager
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -78,7 +79,6 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_v2_active,
 )
-from sglang.srt.bwap.bwap_manager import BWAPManager
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -771,6 +771,8 @@ class ModelRunner:
             t_init=self.server_args.bwap_t_init,
             t_explore=self.server_args.bwap_t_explore,
             t_prune=self.server_args.bwap_t_prune,
+            fused=self.server_args.bwap_fused,
+            tp_size=self.ps.tp_size,
         )
 
     def maybe_enable_batch_invariant_mode(self):

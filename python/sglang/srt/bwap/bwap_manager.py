@@ -68,10 +68,15 @@ accuracy-retention, and realized sparsity, not throughput.
 import enum
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.bwap.bwap_fused import (
+    fast_path_eligible,
+    fused_pruned_mlp,
+    gather_ffn_weights,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -168,12 +173,16 @@ class BWAPManager:
         t_init: int = 8,
         t_explore: int = 4,
         t_prune: int = 16,
+        fused: bool = False,
+        tp_size: int = 1,
     ):
         self.sparsity = sparsity
         self.t_init = t_init
         self.t_explore = t_explore
         self.t_prune = t_prune
         self.t_trans = t_explore + t_prune
+        self.fused = fused
+        self.tp_size = tp_size
 
         self.hook_targets = find_act_fn_hook_targets(base_model)
         if not self.hook_targets:
@@ -181,6 +190,13 @@ class BWAPManager:
                 "BWAP: no '*.mlp.act_fn' (SiluAndMul) modules found; "
                 "--enable-bwap will have no effect on this model."
             )
+        # For Phase-2a: the gated-MLP module parent of each act_fn (keyed by the
+        # same act_fn name as the mem/mask state), so the fused forward can gather
+        # the layer's gate_up/down weights.
+        self.gated_mlps: Dict[str, torch.nn.Module] = {}
+        if fused:
+            for name in self.hook_targets:
+                self.gated_mlps[name] = base_model.get_submodule(name.rsplit(".", 1)[0])
 
         # Per-layer state, keyed by module name, lazily allocated on the first
         # hook call (the local intermediate size is only known then).
@@ -203,6 +219,14 @@ class BWAPManager:
         self._collect_rows: Optional[torch.Tensor] = None
         self._has_prune = False
         self._has_collect = False
+        self._all_prune = False  # every active row is pruning -> fast path eligible
+
+        # Phase-2a fused-forward state (keyed by act_fn name).
+        self._fast_ok: Dict[str, bool] = {}  # layer eligible for the gather path
+        self._gate_up_k: Dict[str, torch.Tensor] = {}  # gathered gate+up rows
+        self._down_k: Dict[str, torch.Tensor] = {}  # gathered down columns
+        self._gathered_version: Dict[str, int] = {}  # mask_version the gather reflects
+        self._orig_forwards: Dict[str, Callable] = {}  # saved mlp.forward for teardown
 
         # Row-step accounting for realized_sparsity (a row-step is one request
         # advanced one decode step; prompt/exploration row-steps are never pruned).
@@ -239,6 +263,7 @@ class BWAPManager:
             self._prune_rows = self._collect_rows = None
             self._has_prune = False
             self._has_collect = True
+            self._all_prune = False
         elif forward_mode.is_decode():
             self._phase = _Phase.DECODE
             steps = self._decode_steps(req_pool_indices, seq_lens)
@@ -247,10 +272,15 @@ class BWAPManager:
             )
             self._has_prune = bool(self._prune_rows.any())
             self._has_collect = bool(self._collect_rows.any())
+            # Fast gather path applies only when the whole active batch is pruning
+            # (a shared mask, no rows still exploring); mixed steps fall back to
+            # the per-row Phase-1 masked path.
+            self._all_prune = self._has_prune and not self._has_collect
             self._total_row_steps += int(steps.numel())
             self._pruned_row_steps += int(self._prune_rows.sum())
         else:
             self._phase = _Phase.IDLE
+            self._all_prune = False
 
     def _decode_steps(
         self, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
@@ -328,15 +358,84 @@ class BWAPManager:
         self.mem_version[name] = self.mem_version.get(name, 0) + 1
 
     def _get_mask(self, name: str, z: torch.Tensor) -> torch.Tensor:
-        dim = z.shape[-1]
+        return self._materialize_mask(name, z.shape[-1], z.device).to(z.dtype)
+
+    def _materialize_mask(
+        self, name: str, dim: int, device: torch.device
+    ) -> torch.Tensor:
+        """Build/refresh the shared keep-mask for a layer from its scores.
+
+        Split out from ``_get_mask`` so the fused forward can (re)build the mask
+        without an activation tensor to read the shape/device from.
+        """
         mem = self.mem_scores.get(name)
         stale = self.mask_version.get(name) != self.mem_version.get(name)
         if name not in self.masks or stale:
             if mem is None:
                 # No scores collected yet (e.g. T_init=0 before any prompt): an
                 # all-ones mask reproduces the dense output exactly.
-                self.masks[name] = torch.ones(dim, dtype=torch.float32, device=z.device)
+                self.masks[name] = torch.ones(dim, dtype=torch.float32, device=device)
             else:
                 self.masks[name] = build_topk_mask(mem, self.sparsity)
             self.mask_version[name] = self.mem_version.get(name, 0)
-        return self.masks[name].to(z.dtype)
+        return self.masks[name]
+
+    # ---- Phase 2a: fused gather-GEMM forward ------------------------------
+    def install_fused_forwards(self) -> None:
+        """Wrap each gated MLP's ``forward`` with the fused fast path.
+
+        Installed alongside ``register_hooks`` (both after CUDA-graph capture):
+        the wrapper short-circuits to the gather-GEMM on all-prune decode steps
+        of eligible layers, and otherwise calls the original dense forward — at
+        which point the act_fn hook applies the Phase-1 collect/mask. The two are
+        mutually exclusive per step, so no double-processing.
+        """
+        n_ok = 0
+        for name, mlp in self.gated_mlps.items():
+            self._fast_ok[name] = fast_path_eligible(
+                mlp.gate_up_proj, mlp.down_proj, self.tp_size
+            )
+            n_ok += int(self._fast_ok[name])
+            self._orig_forwards[name] = mlp.forward
+            mlp.forward = self._make_mlp_forward(name, mlp)
+        logger.info(
+            "BWAP: fused gather-GEMM installed on %d/%d gated MLPs "
+            "(others fall back to the masked path; tp_size=%d).",
+            n_ok,
+            len(self.gated_mlps),
+            self.tp_size,
+        )
+
+    def remove_fused_forwards(self) -> None:
+        for name, orig in self._orig_forwards.items():
+            self.gated_mlps[name].forward = orig
+        self._orig_forwards = {}
+
+    def _make_mlp_forward(self, name: str, mlp: torch.nn.Module):
+        orig = self._orig_forwards[name]
+
+        def forward(x, *args, **kwargs):
+            if (
+                self._phase is _Phase.DECODE
+                and self._all_prune
+                and self._fast_ok.get(name, False)
+            ):
+                return self._fast_mlp_forward(name, mlp, x)
+            return orig(x, *args, **kwargs)
+
+        return forward
+
+    def _fast_mlp_forward(
+        self, name: str, mlp: torch.nn.Module, x: torch.Tensor
+    ) -> torch.Tensor:
+        weight = mlp.down_proj.weight
+        d_ff = self._materialize_mask(name, weight.shape[1], weight.device).shape[0]
+        if self._gathered_version.get(name) != self.mask_version.get(name):
+            keep_idx = self.masks[name].bool().nonzero(as_tuple=False).squeeze(-1)
+            gate_up_k, down_k = gather_ffn_weights(
+                mlp.gate_up_proj.weight, weight, keep_idx, d_ff
+            )
+            self._gate_up_k[name] = gate_up_k.to(x.dtype)
+            self._down_k[name] = down_k.to(x.dtype)
+            self._gathered_version[name] = self.mask_version.get(name, 0)
+        return fused_pruned_mlp(x, self._gate_up_k[name], self._down_k[name])
