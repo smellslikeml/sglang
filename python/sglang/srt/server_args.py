@@ -2985,6 +2985,35 @@ class ServerArgs:
     ] = 0.0
 
     # -------------------------------------------------------------------------
+    # BWAP (batch-wise adaptive pruning)
+    # -------------------------------------------------------------------------
+    enable_bwap: A[
+        bool,
+        "Enable batch-wise adaptive pruning (BWAP): training-free, inference-time FFN neuron pruning for gated-MLP models. A post-forward hook on each `*.mlp.act_fn` (SiluAndMul) masks low-importance neurons of the activation during sparse decode steps. Phase-1 functional integration: eager forward path only (CUDA-graph replay does not run hooks).",
+        NS("bwap"),
+    ] = False
+    bwap_sparsity: A[
+        float,
+        "Target FFN neuron sparsity for BWAP; each sparse step keeps the top round((1 - sparsity) * D_FF) neurons per layer (per TP shard).",
+        NS("bwap"),
+    ] = 0.5
+    bwap_t_init: A[
+        int,
+        "Number of initial dense-exploration decode steps before the first BWAP mask is built (T_init).",
+        NS("bwap"),
+    ] = 8
+    bwap_t_explore: A[
+        int,
+        "Number of dense-exploration decode steps per BWAP refresh cycle (T_E).",
+        NS("bwap"),
+    ] = 4
+    bwap_t_prune: A[
+        int,
+        "Number of sparse (pruned) decode steps per BWAP refresh cycle (T_p). The full cycle is T_trans = T_E + T_p.",
+        NS("bwap"),
+    ] = 16
+
+    # -------------------------------------------------------------------------
     # Two batch overlap
     # -------------------------------------------------------------------------
     enable_two_batch_overlap: A[
@@ -9260,6 +9289,9 @@ class ServerArgs:
         # Check LoRA
         self.check_lora_server_args()
 
+        # Check BWAP
+        self.check_bwap_server_args()
+
         # Check speculative decoding
         if self.speculative_algorithm is not None:
             assert (
@@ -9546,6 +9578,26 @@ class ServerArgs:
             assert (
                 self.lora_drain_wait_threshold >= 0.0
             ), "--lora-drain-wait-threshold must be non-negative."
+
+    def check_bwap_server_args(self):
+        if not self.enable_bwap:
+            return
+
+        assert (
+            0.0 <= self.bwap_sparsity < 1.0
+        ), "--bwap-sparsity must be in [0, 1)."
+        assert self.bwap_t_init >= 0, "--bwap-t-init must be non-negative."
+        assert self.bwap_t_explore >= 1, "--bwap-t-explore must be positive."
+        assert self.bwap_t_prune >= 1, "--bwap-t-prune must be positive."
+
+        if self.cuda_graph_config.decode.backend != Backend.DISABLED:
+            logger.warning(
+                "--enable-bwap only takes effect on the eager forward path: "
+                "CUDA-graph replay does not run the BWAP forward hooks, so "
+                "graph-replayed decode steps stay dense. Disable the decode "
+                "CUDA graph (--disable-decode-cuda-graph) for BWAP-pruned "
+                "decoding."
+            )
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:

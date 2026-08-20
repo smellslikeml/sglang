@@ -78,6 +78,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_v2_active,
 )
+from sglang.srt.bwap.bwap_manager import BWAPManager
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -658,6 +659,7 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.maybe_init_bwap_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
 
@@ -753,6 +755,23 @@ class ModelRunner:
     def maybe_init_lora_manager(self):
         if get_lora().enable_lora:
             self.init_lora_manager()
+
+    def maybe_init_bwap_manager(self):
+        # Draft workers run their own model; BWAP Phase 1 targets the target
+        # model's decode path only.
+        if self.server_args.enable_bwap and not self.is_draft_worker:
+            self.init_bwap_manager()
+        else:
+            self.bwap_manager = None
+
+    def init_bwap_manager(self):
+        self.bwap_manager = BWAPManager(
+            base_model=self.model,
+            sparsity=self.server_args.bwap_sparsity,
+            t_init=self.server_args.bwap_t_init,
+            t_explore=self.server_args.bwap_t_explore,
+            t_prune=self.server_args.bwap_t_prune,
+        )
 
     def maybe_enable_batch_invariant_mode(self):
         if get_exec().deterministic.enable_deterministic_inference:
