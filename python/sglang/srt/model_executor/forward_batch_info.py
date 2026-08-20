@@ -934,7 +934,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.server_args.enable_bwap
             and model_runner.bwap_manager is not None
         ):
-            model_runner.bwap_manager.prepare_bwap_batch(ret)
+            model_runner.bwap_manager.prepare_bwap_batch(
+                forward_mode=ret.forward_mode,
+                req_pool_indices=ret.req_pool_indices,
+                seq_lens=ret.seq_lens,
+            )
 
         if (
             model_runner.ps.attn_dcp_size > 1

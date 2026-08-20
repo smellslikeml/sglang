@@ -14,7 +14,6 @@
 
 """Unit tests for the Phase-1 functional BWAP integration."""
 
-import types
 import unittest
 
 import torch
@@ -22,10 +21,10 @@ from torch import nn
 
 from sglang.srt.bwap.bwap_manager import (
     BWAPManager,
-    _StepMode,
     build_topk_mask,
     compute_decode_scores,
     compute_prompt_scores,
+    compute_row_modes,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -61,15 +60,29 @@ class TinyModel(nn.Module):
         return self.mlp(x)
 
 
-def _make_manager(**overrides):
+def _make_manager(model=None, **overrides):
+    # Bind the manager to the model under test so register_hooks() attaches to
+    # the very modules the test forwards run through. Schedule-only tests, which
+    # never forward a model, may omit it and get a throwaway one.
     kwargs = dict(sparsity=0.5, t_init=2, t_explore=1, t_prune=2)
     kwargs.update(overrides)
-    return BWAPManager(base_model=TinyModel(), **kwargs)
+    return BWAPManager(base_model=model if model is not None else TinyModel(), **kwargs)
 
 
-def _forward_batch(forward_mode):
-    # prepare_bwap_batch only reads forward_mode off the batch.
-    return types.SimpleNamespace(forward_mode=forward_mode)
+def _extend(manager, *, req_ids, prompt_len=5):
+    manager.prepare_bwap_batch(
+        forward_mode=ForwardMode.EXTEND,
+        req_pool_indices=torch.tensor(req_ids),
+        seq_lens=torch.tensor([prompt_len] * len(req_ids)),
+    )
+
+
+def _decode(manager, *, req_ids, seq_lens):
+    manager.prepare_bwap_batch(
+        forward_mode=ForwardMode.DECODE,
+        req_pool_indices=torch.tensor(req_ids),
+        seq_lens=torch.tensor(seq_lens),
+    )
 
 
 def _run_hooked(model, manager, x):
@@ -111,39 +124,56 @@ class TestBWAPScores(CustomTestCase):
 
 
 class TestBWAPSchedule(CustomTestCase):
-    def test_three_phase_schedule(self):
-        manager = _make_manager()  # t_init=2, t_p=2, t_e=1, t_trans=3
-        modes = []
-        for _ in range(2 + 3 * 2):
-            manager.prepare_bwap_batch(_forward_batch(ForwardMode.DECODE))
-            modes.append(manager._mode)
-        # Phase 2: T_init=2 explore steps. Then cycles of [P, P, E].
-        self.assertEqual(
-            modes,
-            [
-                _StepMode.EXPLORE,
-                _StepMode.EXPLORE,
-                _StepMode.PRUNE,
-                _StepMode.PRUNE,
-                _StepMode.EXPLORE,
-                _StepMode.PRUNE,
-                _StepMode.PRUNE,
-                _StepMode.EXPLORE,
-            ],
-        )
-
-    def test_extend_is_prompt_phase_and_does_not_advance_decode_step(self):
+    def test_single_request_three_phase_schedule(self):
+        # Derived property: one request's decode steps 0..7 follow T_init(2)
+        # explore steps, then cycles of [prune, prune, explore] (t_p=2, t_e=1).
         manager = _make_manager()
+        _extend(manager, req_ids=[0])
+        pruned = []
+        for step in range(8):
+            _decode(manager, req_ids=[0], seq_lens=[5 + step])
+            pruned.append(bool(manager._prune_rows[0]))
+        self.assertEqual(pruned, [False, False, True, True, False, True, True, False])
 
-        manager.prepare_bwap_batch(_forward_batch(ForwardMode.EXTEND))
-        self.assertIs(manager._mode, _StepMode.PROMPT)
-        self.assertEqual(manager.decode_step, 0)
+    def test_late_joiner_gets_its_own_t_init(self):
+        # Bug regression: with a single global step counter, a request joining a
+        # running batch mid-cycle is pruned immediately using a mask built from
+        # the other requests' activations, never getting its own exploration.
+        # Per-request scheduling must let the late joiner explore first.
+        manager = _make_manager()
+        _extend(manager, req_ids=[0])
+        for step in range(6):  # push req 0 well past T_init into a prune phase
+            _decode(manager, req_ids=[0], seq_lens=[5 + step])
+        self.assertTrue(bool(manager._prune_rows[0]))
+
+        _extend(manager, req_ids=[1])  # a new request joins
+        _decode(manager, req_ids=[0, 1], seq_lens=[11, 5])  # mixed decode
+        self.assertTrue(bool(manager._prune_rows[0]))  # established req still prunes
+        self.assertFalse(bool(manager._prune_rows[1]))  # late joiner explores
+        self.assertTrue(bool(manager._collect_rows[1]))
+
+    def test_synchronized_batch_reduces_to_global_schedule(self):
+        # Derived property: when every row shares a step, the per-row modes are
+        # the paper's single global schedule — the whole batch prunes together
+        # or explores together, and the two masks are exact complements.
+        manager = _make_manager()
+        for step in range(12):
+            steps = torch.full((4,), step)
+            prune, collect = compute_row_modes(
+                steps,
+                t_init=manager.t_init,
+                t_prune=manager.t_prune,
+                t_trans=manager.t_trans,
+            )
+            self.assertTrue(bool(prune.all()) or bool(collect.all()))
+            self.assertTrue(torch.equal(prune, ~collect))
 
     def test_realized_sparsity_discounts_dense_steps(self):
-        manager = _make_manager()  # sparsity 0.5; per cycle: 2 prune, 1 explore
-        for _ in range(2 + 3):
-            manager.prepare_bwap_batch(_forward_batch(ForwardMode.DECODE))
-        # dense = t_init(2) + explore(1) = 3, prune = 2
+        # sparsity 0.5; decode steps 0..4 are E,E,P,P,E -> 2 pruned of 5.
+        manager = _make_manager()
+        _extend(manager, req_ids=[0])
+        for step in range(5):
+            _decode(manager, req_ids=[0], seq_lens=[5 + step])
         self.assertAlmostEqual(manager.realized_sparsity, 0.5 * 2 / 5)
 
 
@@ -159,33 +189,55 @@ class TestBWAPHookIntegration(CustomTestCase):
             dense = model(x)
 
         # sparsity=0 -> k = D -> all-ones mask -> dense output exactly.
-        manager = _make_manager(sparsity=0.0)
-        manager.prepare_bwap_batch(_forward_batch(ForwardMode.EXTEND))
-        out = _run_hooked(model, manager, x)
-        for _ in range(3):  # past t_init, into a prune step
-            manager.prepare_bwap_batch(_forward_batch(ForwardMode.DECODE))
+        manager = _make_manager(model, sparsity=0.0)
+        _extend(manager, req_ids=[0, 1, 2, 3])
+        _run_hooked(model, manager, x)
+        for step in range(3):  # past t_init, into a prune step
+            _decode(manager, req_ids=[0, 1, 2, 3], seq_lens=[5 + step] * 4)
         out = _run_hooked(model, manager, x)
         torch.testing.assert_close(out, dense)
 
     def test_pruned_step_applies_mask_and_stays_finite(self):
         model = TinyModel()
         x = torch.randn(4, HIDDEN)
-        manager = _make_manager()
+        manager = _make_manager(model)
 
-        # Prompt (s0) + t_init explore steps.
-        manager.prepare_bwap_batch(_forward_batch(ForwardMode.EXTEND))
-        _run_hooked(model, manager, x)
-        for _ in range(2):
-            manager.prepare_bwap_batch(_forward_batch(ForwardMode.DECODE))
+        _extend(manager, req_ids=[0, 1, 2, 3])
+        _run_hooked(model, manager, x)  # collect s0
+        for step in range(2):  # t_init explore steps
+            _decode(manager, req_ids=[0, 1, 2, 3], seq_lens=[5 + step] * 4)
             _run_hooked(model, manager, x)
 
-        # First prune step: builds the mask from the max-aggregated scores
-        # and applies it.
-        manager.prepare_bwap_batch(_forward_batch(ForwardMode.DECODE))
+        # First prune step: build the mask from the max-aggregated scores.
+        _decode(manager, req_ids=[0, 1, 2, 3], seq_lens=[7] * 4)
         pruned = _run_hooked(model, manager, x)
         mask = manager.masks["mlp.act_fn"]
         self.assertEqual(int(mask.sum().item()), INTERMEDIATE // 2)
         self.assertTrue(bool(torch.isfinite(pruned).all()))
+
+    def test_mixed_batch_prunes_only_in_cycle_rows(self):
+        # Bug regression (end-to-end): in one decode forward with an established
+        # request (pruning) and a late joiner (exploring), the returned
+        # activation must mask only the established row and leave the joiner
+        # dense — a single global mask would wrongly prune both.
+        model = TinyModel()
+        manager = _make_manager(model)
+        _extend(manager, req_ids=[0])
+        _run_hooked(model, manager, torch.randn(3, HIDDEN))  # prompt s0 -> mem
+        for step in range(6):  # real explore/prune forwards populate mem + mask
+            _decode(manager, req_ids=[0], seq_lens=[5 + step])
+            _run_hooked(model, manager, torch.randn(1, HIDDEN))
+        _extend(manager, req_ids=[1])
+        _decode(manager, req_ids=[0, 1], seq_lens=[11, 5])  # req0 prunes, req1 explores
+
+        z = torch.randn(2, INTERMEDIATE)
+        out = manager._process_activation("mlp.act_fn", z)
+        mask = manager.masks["mlp.act_fn"].bool()
+        self.assertEqual(
+            int(mask.sum().item()), INTERMEDIATE // 2
+        )  # a real top-k, not all-ones
+        torch.testing.assert_close(out[0], z[0] * mask)  # established: pruned
+        torch.testing.assert_close(out[1], z[1])  # late joiner: dense
 
     def test_mask_refresh_follows_mem_version(self):
         manager = _make_manager()
