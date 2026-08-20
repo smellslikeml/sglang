@@ -1,0 +1,45 @@
+name: Outrider daily (branch-mode, drafter)
+
+# Drafter tier of the two-tier setup: high-frequency, cheap-model
+# exploration. Publishes as branch — no PR/Issue, no maintainer signal.
+# Every dispatch accumulates repo intel; outrider-weekly-refine.yml
+# promotes one accumulated branch per week to a ready-for-review PR.
+#
+# Backend for this tier: provider=anthropic model=(provider default)
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  # Deliberately static, unlike outrider.yml's per-target group:
+  # every drafter run commits to the same accumulated intel branch, so two in
+  # flight would race on the push. One at a time is protective here, and the
+  # drafter is cron/dispatcher-driven rather than fired in batches.
+  group: outrider-drafter
+  cancel-in-progress: false
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: remyxai/outrider@v1
+        with:
+          interest-id: dde8beee-a824-4490-af9a-cc273f958ff3
+          publish: branch
+          # Drafter defaults: accumulate intel, skip research (cost is
+          # proportionate weekly, not at daily drafter frequency).
+          maintain-state: 'true'
+          staged-synthesis: 'false'
+          rate-limit-days: '0'
+          # Backend-matched agent timeout (thinking-mode backends need 3600s).
+          claude-timeout: '900'
