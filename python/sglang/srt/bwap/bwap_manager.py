@@ -230,6 +230,11 @@ class BWAPManager:
         self._down_buf: Dict[str, torch.Tensor] = {}  # [hidden, k] down columns
         self._gathered_version: Dict[str, int] = {}  # mask_version the buffers reflect
         self._orig_forwards: Dict[str, Callable] = {}  # saved mlp.forward for teardown
+        # Phase-2b throughput probe: when set (only around decode-graph capture),
+        # the wrapper unconditionally takes the gather path over pre-filled dummy
+        # buffers, so the captured decode graph is the k-width pruned FFN. Correctness
+        # is ignored (dummy mask) — this measures the end-to-end speedup ceiling.
+        self._capture_force = False
 
         # Row-step accounting for realized_sparsity (a row-step is one request
         # advanced one decode step; prompt/exploration row-steps are never pruned).
@@ -418,6 +423,12 @@ class BWAPManager:
         orig = self._orig_forwards[name]
 
         def forward(x, *args, **kwargs):
+            # Probe: force the gather path over pre-filled dummy buffers so the
+            # captured decode graph is the pruned FFN (correctness ignored).
+            if self._capture_force and self._fast_ok.get(name, False):
+                return fused_pruned_mlp(
+                    x, self._gate_up_buf[name], self._down_buf[name]
+                )
             if (
                 self._phase is _Phase.DECODE
                 and self._all_prune
@@ -431,6 +442,30 @@ class BWAPManager:
             return orig(x, *args, **kwargs)
 
         return forward
+
+    def begin_capture(self) -> None:
+        """Phase-2b throughput probe: pre-fill fixed-size dummy gathered buffers
+        (first k neurons) for every eligible layer and force the gather path, so
+        the decode graph captured next runs the k-width pruned FFN. Buffers are
+        allocated here (before capture) so no cudaMalloc happens during capture.
+        Correctness is intentionally ignored — this measures the speedup ceiling.
+        """
+        for name, mlp in self.gated_mlps.items():
+            if not self._fast_ok.get(name, False):
+                continue
+            weight = mlp.down_proj.weight
+            d_ff = weight.shape[1]
+            k = int(round((1.0 - self.sparsity) * d_ff))
+            keep_idx = torch.arange(k, device=weight.device)  # dummy: first k
+            gate_up_k, down_k = gather_ffn_weights(
+                mlp.gate_up_proj.weight, weight, keep_idx, d_ff
+            )
+            self._gate_up_buf[name] = gate_up_k.contiguous()
+            self._down_buf[name] = down_k.contiguous()
+        self._capture_force = True
+
+    def end_capture(self) -> None:
+        self._capture_force = False
 
     def _fast_mlp_forward(
         self, name: str, mlp: torch.nn.Module, x: torch.Tensor

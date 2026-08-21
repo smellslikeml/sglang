@@ -174,6 +174,18 @@ def capture_cuda_graphs(
         memory_usage_gb=0,
         capture_time=0,
     )
+    # Phase-2b throughput probe: install the fused wrapper + force the gather path
+    # BEFORE decode capture (prefill above stays dense), so the captured decode
+    # graph is the k-width pruned FFN. Perf measurement only — output is garbage.
+    bwap_probe = (
+        model_runner.bwap_manager is not None
+        and model_runner.server_args.bwap_fused
+        and model_runner.server_args.bwap_probe
+    )
+    if bwap_probe:
+        model_runner.bwap_manager.install_fused_forwards()
+        model_runner.bwap_manager.begin_capture()
+
     if capture_decode_cuda_graph:
         if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
             decode = capture_decode_graph(model_runner=model_runner)
@@ -189,6 +201,9 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
+    if bwap_probe:
+        model_runner.bwap_manager.end_capture()
+
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
     # fire only on the eager forward path (capture replay never runs Python
@@ -200,7 +215,9 @@ def capture_cuda_graphs(
     # BWAP pruning hooks follow the same rule: post-capture, eager-path only.
     if model_runner.bwap_manager is not None:
         model_runner.bwap_manager.register_hooks()
-        if model_runner.server_args.bwap_fused:
+        # In probe mode the fused wrapper is already installed pre-capture; don't
+        # re-wrap (would double-save orig_forward and break teardown).
+        if model_runner.server_args.bwap_fused and not bwap_probe:
             model_runner.bwap_manager.install_fused_forwards()
 
     prealloc_symmetric_memory_pool(

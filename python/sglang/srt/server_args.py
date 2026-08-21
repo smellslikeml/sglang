@@ -3017,6 +3017,11 @@ class ServerArgs:
         "Phase-2a: on all-prune decode steps, compute only the retained neurons via a gather-GEMM (real FFN speedup) instead of masking the full activation. Falls back to the masked path for quantized weights, TP>1, or mixed-phase batches. Requires --enable-bwap.",
         NS("bwap"),
     ] = False
+    bwap_probe: A[
+        bool,
+        "Phase-2b THROUGHPUT PROBE (perf measurement only, NOT correct): force the k-width gather FFN into the captured decode graph with a frozen dummy mask, to measure the end-to-end decode-throughput ceiling vs dense. Output is garbage — use only to decide whether the graph-captured speedup is worth building correctly. Requires --enable-bwap --bwap-fused with CUDA graph enabled.",
+        NS("bwap"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Two batch overlap
