@@ -242,6 +242,12 @@ class BWAPManager:
         # them keeps the captured pruned FFN correct.
         self._gu_int: Dict[str, torch.Tensor] = {}  # [max_bs, 2k] gate_up scratch
         self._z_int: Dict[str, torch.Tensor] = {}  # [max_bs, k] activation scratch
+        # Divergence probe (BWAP_DIVERGENCE_PROBE): persistent per-layer copy of the
+        # FFN INPUT recorded inside the captured graph, so after a replay we can read
+        # back (input, output) per layer and compare the output to an eager recompute.
+        self._x_buf: Dict[str, torch.Tensor] = {}  # [max_bs, hidden] replayed FFN input
+        self._divergence_done = False
+        self._decode_since_gate = 0
         self._gathered_version: Dict[str, int] = {}  # mask_version the buffers reflect
         self._orig_forwards: Dict[str, Callable] = {}  # saved mlp.forward for teardown
         # Phase-2b throughput probe: when set (only around decode-graph capture),
@@ -304,6 +310,13 @@ class BWAPManager:
             self._all_prune = False
         elif forward_mode.is_decode():
             self._phase = _Phase.DECODE
+            # Divergence probe: after the 2nd decode, the persistent buffers hold the
+            # 1st decode's REPLAYED (input, output) per layer — compare vs eager.
+            if self._x_buf and not self._divergence_done:
+                self._decode_since_gate += 1
+                if self._decode_since_gate >= 2:
+                    self._check_divergence()
+                    self._divergence_done = True
             steps = self._decode_steps(req_pool_indices, seq_lens)
             self._prune_rows, self._collect_rows = compute_row_modes(
                 steps, t_init=self.t_init, t_prune=self.t_prune, t_trans=self.t_trans
@@ -468,6 +481,8 @@ class BWAPManager:
             # (a pool-allocated output is clobbered across layers on replay).
             if self._capture_force and self._fast_ok.get(name, False):
                 t = x.shape[0]
+                if name in self._x_buf:  # divergence probe: record FFN input in-graph
+                    self._x_buf[name][:t].copy_(x)
                 return fused_pruned_mlp_pool_free(
                     x,
                     self._gate_up_buf[name],
@@ -549,6 +564,10 @@ class BWAPManager:
             self._z_int[name] = torch.empty(
                 max_bs, k, device=weight.device, dtype=weight.dtype
             )
+            if os.environ.get("BWAP_DIVERGENCE_PROBE"):
+                self._x_buf[name] = torch.empty(
+                    max_bs, hidden, device=weight.device, dtype=weight.dtype
+                )
         self._capture_force = True
         # Warm the k-width GEMM shapes OUTSIDE the graph. SGLang's eager run-once
         # warms only the DENSE FFN shapes, so these novel reduced-width (k<D_ff)
@@ -645,6 +664,61 @@ class BWAPManager:
         logger.info(
             "BWAP: warmup complete (%d decode forwards) — froze mask, opened graph gate.",
             self._decode_forwards,
+        )
+
+    def _check_divergence(self, t: int = 1) -> None:
+        """Localize the in-model graph-replay corruption using the persistent buffers
+        that survive replay. For each layer, `_x_buf` holds the FFN INPUT the replay
+        saw and `_out_buf` its OUTPUT; recompute the FFN eagerly (same function, same
+        baked weights) on that input and compare. Three diagnosable outcomes:
+          - input already non-finite/garbage -> corruption is UPSTREAM of the FFN
+            (attention/norm/residual under replay), the FFN is a victim;
+          - output != eager(input) -> the FFN op itself is wrong under replay;
+          - both fine -> FFN correct under replay; corruption is in propagation.
+        """
+        logger.info(
+            "BWAP divergence probe: replay-buffer vs eager(same input), first %d row(s)",
+            t,
+        )
+        n_layers = n_diverge = n_bad_input = 0
+        for name in self.gated_mlps:
+            if not self._fast_ok.get(name, False) or name not in self._x_buf:
+                continue
+            n_layers += 1
+            x = self._x_buf[name][:t]
+            eager_out = fused_pruned_mlp_pool_free(
+                x,
+                self._gate_up_buf[name],
+                self._down_buf[name],
+                gate_up_buf=torch.empty_like(self._gu_int[name][:t]),
+                z_buf=torch.empty_like(self._z_int[name][:t]),
+                out=torch.empty_like(self._out_buf[name][:t]),
+            )
+            replay_out = self._out_buf[name][:t]
+            x_finite = bool(torch.isfinite(x).all().item())
+            out_finite = bool(torch.isfinite(replay_out).all().item())
+            out_diff = (replay_out.float() - eager_out.float()).abs().max().item()
+            x_norm = x.float().norm().item()
+            diverges = (not out_finite) or out_diff > 1e-2
+            n_diverge += int(diverges)
+            n_bad_input += int(not x_finite)
+            if diverges or not x_finite:
+                logger.info(
+                    "  [%s] x_finite=%s x_norm=%.4g | out_finite=%s "
+                    "|replay_out - eager(x)|max=%.4g -> %s",
+                    name,
+                    x_finite,
+                    x_norm,
+                    out_finite,
+                    out_diff,
+                    "INPUT BAD (upstream)" if not x_finite else "FFN OP DIVERGES",
+                )
+        logger.info(
+            "BWAP divergence probe SUMMARY: %d layers; %d with bad INPUT (upstream); "
+            "%d whose FFN OUTPUT diverges from eager(same input).",
+            n_layers,
+            n_bad_input,
+            n_diverge,
         )
 
     def register_graph_buffers(self, registry) -> None:
