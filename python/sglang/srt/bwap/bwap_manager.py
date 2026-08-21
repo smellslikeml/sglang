@@ -488,6 +488,13 @@ class BWAPManager:
             self._gate_up_buf[name] = gate_up_k.contiguous()
             self._down_buf[name] = down_k.contiguous()
         self._capture_force = True
+        if self._gate_up_buf:
+            _k0 = next(iter(self._gate_up_buf))
+            logger.info(
+                "BWAP capture: gate_up_buf[%s] ptr=%x",
+                _k0,
+                self._gate_up_buf[_k0].data_ptr(),
+            )
 
     def end_capture(self) -> None:
         self._capture_force = False
@@ -549,11 +556,21 @@ class BWAPManager:
             return
         from sglang.srt.model_executor.cuda_graph_buffer_registry import GraphSlot
 
+        self._post_fill_logged = False
+
         def _make_post_fill(src: Dict[str, torch.Tensor], key: str):
             # No-op until warmup fills `src`; then copy the frozen weights into the
             # graph buffer on the replay stream (what makes them visible on replay).
             def fill(buffer, forward_batch, ctx):
                 real = src.get(key)
+                if not self._post_fill_logged:
+                    logger.info(
+                        "BWAP post_fill: real_present=%s buf_ptr=%x shape=%s",
+                        real is not None,
+                        buffer.data_ptr(),
+                        tuple(buffer.shape),
+                    )
+                    self._post_fill_logged = True
                 if real is not None:
                     buffer.copy_(real)
 
@@ -573,6 +590,7 @@ class BWAPManager:
                         shape_fn=lambda mb, mt, s=shape: s,
                         dtype=buf.dtype,
                         device=buf.device,
+                        axis="none",  # fixed weight buffers, NOT token-indexed — don't slice
                         copy_from_fb=False,
                         post_fill=_make_post_fill(src, name),
                     ),
