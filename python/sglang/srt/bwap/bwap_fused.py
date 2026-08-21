@@ -80,6 +80,32 @@ def fused_pruned_mlp(
     return F.linear(z_k, down_k)  # [T, hidden]
 
 
+def fused_pruned_mlp_into(
+    x: torch.Tensor,
+    gate_up_k: torch.Tensor,
+    down_k: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Same math as ``fused_pruned_mlp`` but writes the final projection into the
+    caller-owned ``out`` (a persistent buffer allocated outside the CUDA-graph pool).
+
+    This is the capture-safe variant. The dense path's ``down_proj`` is a
+    ``RowParallelLinear`` whose output allocation is lifetime-managed by SGLang's
+    graph machinery; a raw ``F.linear`` output instead lands in the shared graph
+    pool and, because the FFN result outlives its layer (it feeds the next layer's
+    residual add), gets reused/clobbered across the model's layers under a captured
+    replay — producing garbage independent of the weight values. Writing the
+    cross-layer-lived result into ``out`` keeps it stable across replays, matching
+    how the captured dense path behaves. The gate/up and activation tensors stay
+    pool-allocated: they are consumed within the op sequence, so they are never
+    live across another layer's allocation.
+    """
+    gate_up = F.linear(x, gate_up_k)  # [T, 2k]  (pool; consumed immediately)
+    z_k = silu_and_mul(gate_up)  # [T, k]     (pool; consumed immediately)
+    torch.matmul(z_k, down_k.t(), out=out)  # [T, hidden] -> persistent buffer
+    return out
+
+
 def fast_path_eligible(gate_up_proj, down_proj, tp_size: int) -> bool:
     """Whether the gather-GEMM fast path is valid for this layer.
 

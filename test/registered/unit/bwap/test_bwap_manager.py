@@ -23,6 +23,7 @@ from torch import nn
 from sglang.srt.bwap.bwap_fused import (
     fast_path_eligible,
     fused_pruned_mlp,
+    fused_pruned_mlp_into,
     gather_ffn_weights,
     silu_and_mul,
 )
@@ -278,6 +279,14 @@ class TestBWAPFused(CustomTestCase):
         y_fused = fused_pruned_mlp(x, gate_up_k, down_k)
         torch.testing.assert_close(y_dense, y_fused, rtol=1e-5, atol=1e-6)
 
+        # Derived property: the capture-safe _into variant (writes the result into a
+        # caller-owned persistent buffer instead of a fresh pool tensor) computes the
+        # identical value, and actually writes into that buffer (returns a view of it).
+        out = torch.empty(8, hid)  # oversized [max_bs, hidden]; sliced to T=4
+        y_into = fused_pruned_mlp_into(x, gate_up_k, down_k, out=out[: x.shape[0]])
+        torch.testing.assert_close(y_into, y_fused, rtol=1e-5, atol=1e-6)
+        self.assertEqual(y_into.data_ptr(), out.data_ptr())  # wrote into the buffer
+
     def test_eligibility_guards(self):
         model = TinyModel()
         gu, dn = model.mlp.gate_up_proj, model.mlp.down_proj
@@ -343,7 +352,9 @@ class TestBWAPFused(CustomTestCase):
             tp_size=1,
         )
         mgr.install_fused_forwards()
-        mgr.begin_capture()  # allocate fixed dummy buffers (as at capture)
+        mgr.begin_capture(
+            max_bs=8
+        )  # allocate fixed dummy + output buffers (as at capture)
         mgr.end_capture()
         mgr.arm_graph_gating()
         key = next(iter(mgr.gated_mlps))
@@ -357,6 +368,39 @@ class TestBWAPFused(CustomTestCase):
         self.assertTrue(mgr.graph_ready())  # gate opened
         self.assertIn(key, mgr._gate_up_buf)  # buffers filled from the real mask
         self.assertEqual(int(mgr.masks[key].sum().item()), INTERMEDIATE // 2)
+
+    def test_capture_allocates_stable_output_buffer(self):
+        # Bug regression (Phase 2b 2%-accuracy): the captured pruned FFN must write
+        # into a persistent [max_bs, hidden] output buffer allocated before capture,
+        # NOT a fresh (pool-allocated) tensor — a pool output is clobbered across
+        # layers on replay, giving garbage independent of the weights. Guards that
+        # begin_capture allocates the buffer and the captured branch writes into it.
+        model = TinyModel()
+        mgr = BWAPManager(
+            base_model=model,
+            sparsity=0.5,
+            t_init=2,
+            t_explore=1,
+            t_prune=2,
+            fused=True,
+            tp_size=1,
+        )
+        mgr.install_fused_forwards()
+        mgr.begin_capture(max_bs=8)
+        key = next(iter(mgr.gated_mlps))
+        try:
+            out_buf = mgr._out_buf[key]
+            self.assertEqual(out_buf.shape, (8, HIDDEN))  # [max_bs, hidden]
+            # _capture_force is set: the wrapper's capture branch runs and must
+            # return a view into the persistent out_buf (T rows), not a fresh tensor.
+            x = torch.randn(4, HIDDEN)
+            with torch.no_grad():
+                y = model.mlp(x)
+            self.assertEqual(y.data_ptr(), out_buf.data_ptr())  # wrote into out_buf
+            self.assertEqual(y.shape, (4, HIDDEN))
+        finally:
+            mgr.end_capture()
+            mgr.remove_fused_forwards()
 
     def test_gathered_buffers_keep_stable_address_across_refresh(self):
         # Capture-readiness (Phase 2b): the gathered-weight buffers must refresh

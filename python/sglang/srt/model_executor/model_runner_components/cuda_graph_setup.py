@@ -186,7 +186,8 @@ def capture_cuda_graphs(
     )
     if bwap_graph:
         model_runner.bwap_manager.install_fused_forwards()
-        model_runner.bwap_manager.begin_capture()
+        bwap_capture_bs, _ = get_batch_sizes_to_capture(model_runner, 1)
+        model_runner.bwap_manager.begin_capture(max_bs=max(bwap_capture_bs))
 
     if capture_decode_cuda_graph:
         if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):

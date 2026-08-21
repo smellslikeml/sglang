@@ -75,6 +75,7 @@ import torch
 from sglang.srt.bwap.bwap_fused import (
     fast_path_eligible,
     fused_pruned_mlp,
+    fused_pruned_mlp_into,
     gather_ffn_weights,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -175,7 +176,6 @@ class BWAPManager:
         t_prune: int = 16,
         fused: bool = False,
         tp_size: int = 1,
-        model_runner=None,
     ):
         self.sparsity = sparsity
         self.t_init = t_init
@@ -184,11 +184,6 @@ class BWAPManager:
         self.t_trans = t_explore + t_prune
         self.fused = fused
         self.tp_size = tp_size
-        # For Phase-2b recapture: reach the decode CUDA-graph runner to rebuild
-        # the graph AFTER the mask is frozen (bakes the real weights at capture,
-        # sidestepping the post-capture-update-visibility issue).
-        self._model_runner = model_runner
-        self._recapture_pending = False
 
         self.hook_targets = find_act_fn_hook_targets(base_model)
         if not self.hook_targets:
@@ -234,6 +229,12 @@ class BWAPManager:
         # captured CUDA graph reads the same address every replay (Phase 2b).
         self._gate_up_buf: Dict[str, torch.Tensor] = {}  # [2k, hidden] gate+up rows
         self._down_buf: Dict[str, torch.Tensor] = {}  # [hidden, k] down columns
+        # Persistent per-layer FFN output buffers [max_bs, hidden], allocated in
+        # begin_capture (outside the graph pool). The captured pruned FFN writes its
+        # result here instead of a pool-allocated tensor: the FFN output outlives its
+        # layer (feeds the next residual add) and a pool tensor gets clobbered across
+        # layers on replay (garbage independent of weights). See fused_pruned_mlp_into.
+        self._out_buf: Dict[str, torch.Tensor] = {}  # [max_bs, hidden] stable output
         self._gathered_version: Dict[str, int] = {}  # mask_version the buffers reflect
         self._orig_forwards: Dict[str, Callable] = {}  # saved mlp.forward for teardown
         # Phase-2b throughput probe: when set (only around decode-graph capture),
@@ -286,10 +287,6 @@ class BWAPManager:
         this manager. Called next to ``LoRAManager.prepare_lora_batch`` in
         ``ForwardBatch.init_new``.
         """
-        # Phase-2b: once warmup froze the mask, rebuild the decode graph with the
-        # real weights baked in (between forwards, before this batch runs).
-        if self._recapture_pending:
-            self.maybe_recapture()
         if forward_mode.is_extend():
             self._phase = _Phase.PROMPT
             for idx, seq_len in zip(req_pool_indices.tolist(), seq_lens.tolist()):
@@ -458,11 +455,16 @@ class BWAPManager:
         orig = self._orig_forwards[name]
 
         def forward(x, *args, **kwargs):
-            # Probe: force the gather path over pre-filled dummy buffers so the
-            # captured decode graph is the pruned FFN (correctness ignored).
+            # Capture path: force the gather path over the fixed-address buffers so
+            # the decode graph records the k-width pruned FFN. This is the branch the
+            # CUDA graph traces, so its output MUST go to the persistent out_buf
+            # (a pool-allocated output is clobbered across layers on replay).
             if self._capture_force and self._fast_ok.get(name, False):
-                return fused_pruned_mlp(
-                    x, self._gate_up_buf[name], self._down_buf[name]
+                return fused_pruned_mlp_into(
+                    x,
+                    self._gate_up_buf[name],
+                    self._down_buf[name],
+                    out=self._out_buf[name][: x.shape[0]],
                 )
             if (
                 self._phase is _Phase.DECODE
@@ -478,18 +480,24 @@ class BWAPManager:
 
         return forward
 
-    def begin_capture(self) -> None:
-        """Phase-2b throughput probe: pre-fill fixed-size dummy gathered buffers
-        (first k neurons) for every eligible layer and force the gather path, so
-        the decode graph captured next runs the k-width pruned FFN. Buffers are
-        allocated here (before capture) so no cudaMalloc happens during capture.
-        Correctness is intentionally ignored — this measures the speedup ceiling.
+    def begin_capture(self, *, max_bs: int) -> None:
+        """Allocate the fixed-address buffers the captured pruned FFN reads/writes,
+        for every eligible layer, and force the gather path so the decode graph
+        captured next runs the k-width pruned FFN. All buffers are allocated here
+        (before capture) so no cudaMalloc happens during capture:
+
+        - gate_up/down: dummy gathered weights (first k neurons); the real ones are
+          copied in per replay by the registry post_fill after warmup freezes the
+          mask (probe mode skips the freeze and runs these dummies — perf-only).
+        - out: persistent [max_bs, hidden] output buffers (``max_bs`` is the largest
+          captured decode batch), sliced to the batch's token count each forward.
         """
         for name, mlp in self.gated_mlps.items():
             if not self._fast_ok.get(name, False):
                 continue
             weight = mlp.down_proj.weight
             d_ff = weight.shape[1]
+            hidden = weight.shape[0]
             k = int(round((1.0 - self.sparsity) * d_ff))
             keep_idx = torch.arange(k, device=weight.device)  # dummy: first k
             gate_up_k, down_k = gather_ffn_weights(
@@ -497,6 +505,9 @@ class BWAPManager:
             )
             self._gate_up_buf[name] = gate_up_k.contiguous()
             self._down_buf[name] = down_k.contiguous()
+            self._out_buf[name] = torch.empty(
+                max_bs, hidden, device=weight.device, dtype=weight.dtype
+            )
         self._capture_force = True
         if self._gate_up_buf:
             _k0 = next(iter(self._gate_up_buf))
@@ -532,9 +543,13 @@ class BWAPManager:
 
     def _freeze_and_fill(self) -> None:
         """Freeze the warmed-up mask: stash the real gathered weights as the source
-        the registry post_fill copies into the graph buffers each replay, and open
-        the gate. (The captured graph reads _gate_up_buf/_down_buf; a bare copy_ into
-        them from here isn't visible on replay — post_fill on the replay stream is.)"""
+        the registry post_fill copies into the graph buffers each replay, fill them
+        now for the eager/first-replay path, and open the gate.
+
+        The captured graph reads _gate_up_buf/_down_buf (post_fill refreshes them on
+        the replay stream each replay — visible, cf. the pooled-capture probe) and
+        writes into the persistent _out_buf (stable across replay). Both are what
+        make the pruned FFN correct under the captured decode graph; no recapture."""
         for name, mlp in self.gated_mlps.items():
             if not self._fast_ok.get(name, False):
                 continue
@@ -551,38 +566,11 @@ class BWAPManager:
             if name in self._gate_up_buf:
                 self._gate_up_buf[name].copy_(self._real_gate_up[name])
                 self._down_buf[name].copy_(self._real_down[name])
-        # Request a recapture: the graph stays gated (eager) until the decode graph
-        # is rebuilt with these real weights baked in (fill-per-replay proved not
-        # visible in full-model capture; recapture bakes them at capture time).
-        self._recapture_pending = self._model_runner is not None
-        if not self._recapture_pending:
-            self._graph_ready = True  # no runner (tests): fall back to fill path
+        self._graph_ready = True  # open the gate: captured pruned graph is now valid
         logger.info(
-            "BWAP: warmup complete (%d decode forwards) — froze mask; recapture_pending=%s.",
+            "BWAP: warmup complete (%d decode forwards) — froze mask, opened graph gate.",
             self._decode_forwards,
-            self._recapture_pending,
         )
-
-    def maybe_recapture(self) -> None:
-        """Rebuild the decode CUDA graph with the frozen real weights baked in.
-        Triggered between forwards (top of prepare_bwap_batch) once, after freeze.
-        _capture_force makes the wrapper take the gather path during recapture, and
-        the buffers already hold the real weights, so the new graph reads them."""
-        if not self._recapture_pending:
-            return
-        self._recapture_pending = False
-        runner = self._model_runner.decode_cuda_graph_runner
-        if runner is None:
-            self._graph_ready = True  # nothing to recapture; use eager fill fallback
-            return
-        logger.info("BWAP: recapturing decode graph with frozen weights ...")
-        self._capture_force = True
-        try:
-            runner.capture()
-        finally:
-            self._capture_force = False
-        self._graph_ready = True
-        logger.info("BWAP: recapture complete — graph gate opened.")
 
     def register_graph_buffers(self, registry) -> None:
         """Bind the gathered-weight buffers into SGLang's CUDA-graph buffer registry
