@@ -550,10 +550,34 @@ class BWAPManager:
                 max_bs, k, device=weight.device, dtype=weight.dtype
             )
         self._capture_force = True
-        if self._gate_up_buf:
+        # Warm the k-width GEMM shapes OUTSIDE the graph. SGLang's eager run-once
+        # warms only the DENSE FFN shapes, so these novel reduced-width (k<D_ff)
+        # shapes would otherwise first execute — and lazily init cuBLAS algo/
+        # workspace — INSIDE torch.cuda.graph(...), which corrupts replay. That is
+        # the full-width(=dense shapes, works) vs reduced-width(novel, garbage)
+        # split. Run the exact captured path once per shape here, then sync.
+        warm_ts = sorted({1, max_bs})
+        for name in self._gate_up_buf:
+            gate_up_buf = self._gate_up_buf[name]
+            hidden = self._down_buf[name].shape[0]
+            for t in warm_ts:
+                dummy = torch.zeros(
+                    t, hidden, device=gate_up_buf.device, dtype=gate_up_buf.dtype
+                )
+                fused_pruned_mlp_pool_free(
+                    dummy,
+                    gate_up_buf,
+                    self._down_buf[name],
+                    gate_up_buf=self._gu_int[name][:t],
+                    z_buf=self._z_int[name][:t],
+                    out=self._out_buf[name][:t],
+                )
+        if self._gate_up_buf and torch.cuda.is_available():
+            torch.cuda.synchronize()
             _k0 = next(iter(self._gate_up_buf))
             logger.info(
-                "BWAP capture: gate_up_buf[%s] ptr=%x",
+                "BWAP capture: warmed %d k-width shapes; gate_up_buf[%s] ptr=%x",
+                len(self._gate_up_buf),
                 _k0,
                 self._gate_up_buf[_k0].data_ptr(),
             )
