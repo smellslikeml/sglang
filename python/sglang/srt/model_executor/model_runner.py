@@ -773,6 +773,7 @@ class ModelRunner:
             t_prune=self.server_args.bwap_t_prune,
             fused=self.server_args.bwap_fused,
             tp_size=self.ps.tp_size,
+            model_runner=self,
         )
 
     def maybe_enable_batch_invariant_mode(self):

@@ -175,6 +175,7 @@ class BWAPManager:
         t_prune: int = 16,
         fused: bool = False,
         tp_size: int = 1,
+        model_runner=None,
     ):
         self.sparsity = sparsity
         self.t_init = t_init
@@ -183,6 +184,11 @@ class BWAPManager:
         self.t_trans = t_explore + t_prune
         self.fused = fused
         self.tp_size = tp_size
+        # For Phase-2b recapture: reach the decode CUDA-graph runner to rebuild
+        # the graph AFTER the mask is frozen (bakes the real weights at capture,
+        # sidestepping the post-capture-update-visibility issue).
+        self._model_runner = model_runner
+        self._recapture_pending = False
 
         self.hook_targets = find_act_fn_hook_targets(base_model)
         if not self.hook_targets:
@@ -280,6 +286,10 @@ class BWAPManager:
         this manager. Called next to ``LoRAManager.prepare_lora_batch`` in
         ``ForwardBatch.init_new``.
         """
+        # Phase-2b: once warmup froze the mask, rebuild the decode graph with the
+        # real weights baked in (between forwards, before this batch runs).
+        if self._recapture_pending:
+            self.maybe_recapture()
         if forward_mode.is_extend():
             self._phase = _Phase.PROMPT
             for idx, seq_len in zip(req_pool_indices.tolist(), seq_lens.tolist()):
@@ -541,11 +551,38 @@ class BWAPManager:
             if name in self._gate_up_buf:
                 self._gate_up_buf[name].copy_(self._real_gate_up[name])
                 self._down_buf[name].copy_(self._real_down[name])
-        self._graph_ready = True
+        # Request a recapture: the graph stays gated (eager) until the decode graph
+        # is rebuilt with these real weights baked in (fill-per-replay proved not
+        # visible in full-model capture; recapture bakes them at capture time).
+        self._recapture_pending = self._model_runner is not None
+        if not self._recapture_pending:
+            self._graph_ready = True  # no runner (tests): fall back to fill path
         logger.info(
-            "BWAP: warmup complete (%d decode forwards) — froze mask, opened graph gate.",
+            "BWAP: warmup complete (%d decode forwards) — froze mask; recapture_pending=%s.",
             self._decode_forwards,
+            self._recapture_pending,
         )
+
+    def maybe_recapture(self) -> None:
+        """Rebuild the decode CUDA graph with the frozen real weights baked in.
+        Triggered between forwards (top of prepare_bwap_batch) once, after freeze.
+        _capture_force makes the wrapper take the gather path during recapture, and
+        the buffers already hold the real weights, so the new graph reads them."""
+        if not self._recapture_pending:
+            return
+        self._recapture_pending = False
+        runner = self._model_runner.decode_cuda_graph_runner
+        if runner is None:
+            self._graph_ready = True  # nothing to recapture; use eager fill fallback
+            return
+        logger.info("BWAP: recapturing decode graph with frozen weights ...")
+        self._capture_force = True
+        try:
+            runner.capture()
+        finally:
+            self._capture_force = False
+        self._graph_ready = True
+        logger.info("BWAP: recapture complete — graph gate opened.")
 
     def register_graph_buffers(self, registry) -> None:
         """Bind the gathered-weight buffers into SGLang's CUDA-graph buffer registry
@@ -573,10 +610,6 @@ class BWAPManager:
                     self._post_fill_logged = True
                 if real is not None:
                     buffer.copy_(real)
-                    # DIAGNOSTIC: force the copy to complete before the graph
-                    # replays. If this fixes correctness, post_fill was racing the
-                    # replay on a different stream (fix: copy on the replay stream).
-                    torch.cuda.synchronize()
 
             return fill
 
