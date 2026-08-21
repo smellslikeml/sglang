@@ -499,7 +499,15 @@ class BWAPManager:
             d_ff = weight.shape[1]
             hidden = weight.shape[0]
             k = int(round((1.0 - self.sparsity) * d_ff))
-            keep_idx = torch.arange(k, device=weight.device)  # dummy: first k
+            # Data-free importance: keep the k neurons whose down_proj column has
+            # the largest L2 norm (a standard magnitude proxy). This is the mask the
+            # captured graph runs on: the runtime post_fill/refresh of the adaptive
+            # mask is NOT reflected by the replayed full-model graph (only weights
+            # baked at capture are), so a sensible static mask here is what makes the
+            # graph correct — an arbitrary first-k slice yielded garbage. The perf
+            # probe uses this too (k is unchanged, so throughput is identical).
+            importance = weight.norm(dim=0)  # [d_ff] = ||down_proj[:, j]||
+            keep_idx = torch.topk(importance, k).indices.sort().values
             gate_up_k, down_k = gather_ffn_weights(
                 mlp.gate_up_proj.weight, weight, keep_idx, d_ff
             )
