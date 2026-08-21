@@ -174,15 +174,17 @@ def capture_cuda_graphs(
         memory_usage_gb=0,
         capture_time=0,
     )
-    # Phase-2b throughput probe: install the fused wrapper + force the gather path
-    # BEFORE decode capture (prefill above stays dense), so the captured decode
-    # graph is the k-width pruned FFN. Perf measurement only — output is garbage.
-    bwap_probe = (
+    # BWAP Phase 2b: when fused + decode graph are both on, install the wrapper and
+    # force the gather path BEFORE decode capture (prefill above stays dense), so the
+    # captured decode graph is the k-width pruned FFN. Probe fills dummy buffers and
+    # runs the graph from step 0 (perf-only). Real 2b arms graph-gating after capture
+    # so decode stays eager until the warmup builds the real mask (then freezes it in).
+    bwap_graph = (
         model_runner.bwap_manager is not None
         and model_runner.server_args.bwap_fused
-        and model_runner.server_args.bwap_probe
+        and capture_decode_cuda_graph
     )
-    if bwap_probe:
+    if bwap_graph:
         model_runner.bwap_manager.install_fused_forwards()
         model_runner.bwap_manager.begin_capture()
 
@@ -201,8 +203,10 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
-    if bwap_probe:
+    if bwap_graph:
         model_runner.bwap_manager.end_capture()
+        if not model_runner.server_args.bwap_probe:
+            model_runner.bwap_manager.arm_graph_gating()
 
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
@@ -212,12 +216,12 @@ def capture_cuda_graphs(
         register_forward_hooks(
             model_runner.model, model_runner.server_args.forward_hooks
         )
-    # BWAP pruning hooks follow the same rule: post-capture, eager-path only.
+    # BWAP: act_fn hooks are always eager-path only (scoring during warmup / when
+    # graphs are off). The fused wrapper is installed pre-capture for the graph
+    # path (bwap_graph); install it here only for the eager-only fused path.
     if model_runner.bwap_manager is not None:
         model_runner.bwap_manager.register_hooks()
-        # In probe mode the fused wrapper is already installed pre-capture; don't
-        # re-wrap (would double-save orig_forward and break teardown).
-        if model_runner.server_args.bwap_fused and not bwap_probe:
+        if model_runner.server_args.bwap_fused and not bwap_graph:
             model_runner.bwap_manager.install_fused_forwards()
 
     prealloc_symmetric_memory_pool(

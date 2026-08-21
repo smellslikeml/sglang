@@ -650,6 +650,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        # BWAP Phase 2b: while the mask is still being built (eager warmup), keep
+        # decode eager so the act_fn hooks can collect scores; the captured pruned
+        # graph is only valid once the mask is frozen into its buffers.
+        if (
+            self.model_runner.bwap_manager is not None
+            and self.model_runner.server_args.bwap_fused
+            and not self.model_runner.bwap_manager.graph_ready()
+        ):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode

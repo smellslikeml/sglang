@@ -328,6 +328,36 @@ class TestBWAPFused(CustomTestCase):
         y_ref = F.linear(silu_and_mul(F.linear(x, gu_w)) * mask, dn_w)  # masked dense
         torch.testing.assert_close(y_fused, y_ref, rtol=1e-4, atol=1e-5)
 
+    def test_graph_gating_opens_after_warmup_freeze(self):
+        # Phase 2b: armed gating keeps graph_ready() False until `warmup` decode
+        # forwards have built the mask; then _freeze_and_fill fills the buffers and
+        # opens the gate. Guards the eager-warmup → frozen-graph handoff.
+        model = TinyModel()
+        mgr = BWAPManager(
+            base_model=model,
+            sparsity=0.5,
+            t_init=2,
+            t_explore=1,
+            t_prune=2,
+            fused=True,
+            tp_size=1,
+        )
+        mgr.install_fused_forwards()
+        mgr.begin_capture()  # allocate fixed dummy buffers (as at capture)
+        mgr.end_capture()
+        mgr.arm_graph_gating()
+        key = next(iter(mgr.gated_mlps))
+        self.assertFalse(mgr.graph_ready())  # gated until warmup
+
+        mgr._update_mem(key, torch.rand(INTERMEDIATE))  # warmup scoring
+        _extend(mgr, req_ids=[0])
+        for step in range(2):  # _warmup_steps == t_init == 2 decode forwards
+            self.assertFalse(mgr.graph_ready())  # still eager mid-warmup
+            _decode(mgr, req_ids=[0], seq_lens=[5 + step])
+        self.assertTrue(mgr.graph_ready())  # gate opened
+        self.assertIn(key, mgr._gate_up_buf)  # buffers filled from the real mask
+        self.assertEqual(int(mgr.masks[key].sum().item()), INTERMEDIATE // 2)
+
     def test_gathered_buffers_keep_stable_address_across_refresh(self):
         # Capture-readiness (Phase 2b): the gathered-weight buffers must refresh
         # in place (copy_), never be reassigned — a captured CUDA graph replays

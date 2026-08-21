@@ -236,6 +236,16 @@ class BWAPManager:
         # is ignored (dummy mask) — this measures the end-to-end speedup ceiling.
         self._capture_force = False
 
+        # Phase-2b (correct): frozen-mask-after-warmup. can_run_graph() gates the
+        # captured pruned graph on _graph_ready; while False the runner stays eager
+        # so exploration hooks build the real mask. After `_warmup_steps` decode
+        # forwards, _freeze_and_fill() fills the (fixed-address) buffers from the
+        # real mask and opens the gate. Default True = ungated (probe / non-2b).
+        self._graph_ready = True
+        self._graph_gated = False  # armed only for real 2b (graph + fused, non-probe)
+        self._decode_forwards = 0
+        self._warmup_steps = t_init
+
         # Row-step accounting for realized_sparsity (a row-step is one request
         # advanced one decode step; prompt/exploration row-steps are never pruned).
         self._pruned_row_steps = 0
@@ -286,6 +296,15 @@ class BWAPManager:
             self._all_prune = self._has_prune and not self._has_collect
             self._total_row_steps += int(steps.numel())
             self._pruned_row_steps += int(self._prune_rows.sum())
+            # Phase-2b: after the eager warmup builds the real mask, freeze it into
+            # the graph-resident buffers and open the graph gate.
+            if self._graph_gated and not self._graph_ready:
+                self._decode_forwards += 1
+                if (
+                    self._decode_forwards >= self._warmup_steps
+                    and self._all_layers_have_scores()
+                ):
+                    self._freeze_and_fill()
         else:
             self._phase = _Phase.IDLE
             self._all_prune = False
@@ -466,6 +485,51 @@ class BWAPManager:
 
     def end_capture(self) -> None:
         self._capture_force = False
+
+    # ---- Phase 2b (correct): frozen-mask-after-warmup graph gating ----------
+    def arm_graph_gating(self) -> None:
+        """Gate the captured pruned graph until warmup builds the real mask.
+
+        Called at setup for real 2b (fused + decode graph, not the probe). Until
+        `_freeze_and_fill` runs, `can_run_graph` sees `graph_ready()==False` and
+        keeps decode eager so the act_fn hooks collect scores.
+        """
+        self._graph_gated = True
+        self._graph_ready = False
+
+    def graph_ready(self) -> bool:
+        return self._graph_ready
+
+    def _all_layers_have_scores(self) -> bool:
+        return all(
+            self.mem_scores.get(name) is not None
+            for name in self.gated_mlps
+            if self._fast_ok.get(name, False)
+        )
+
+    def _freeze_and_fill(self) -> None:
+        """Freeze the current (warmed-up) mask into the fixed-address buffers and
+        open the graph gate. The buffers already exist (dummy-filled at capture);
+        copy_ keeps their addresses so the captured graph reads the real weights."""
+        for name, mlp in self.gated_mlps.items():
+            if not self._fast_ok.get(name, False):
+                continue
+            weight = mlp.down_proj.weight
+            self._materialize_mask(name, weight.shape[1], weight.device)
+            keep_idx = self.masks[name].bool().nonzero(as_tuple=False).squeeze(-1)
+            gate_up_k, down_k = gather_ffn_weights(
+                mlp.gate_up_proj.weight, weight, keep_idx, weight.shape[1]
+            )
+            if name not in self._gate_up_buf:  # normally pre-allocated at capture
+                self._gate_up_buf[name] = torch.empty_like(gate_up_k)
+                self._down_buf[name] = torch.empty_like(down_k)
+            self._gate_up_buf[name].copy_(gate_up_k)
+            self._down_buf[name].copy_(down_k)
+        self._graph_ready = True
+        logger.info(
+            "BWAP: warmup complete (%d decode forwards) — froze mask, opened graph gate.",
+            self._decode_forwards,
+        )
 
     def _fast_mlp_forward(
         self, name: str, mlp: torch.nn.Module, x: torch.Tensor
