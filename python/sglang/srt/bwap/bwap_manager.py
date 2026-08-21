@@ -78,6 +78,7 @@ from sglang.srt.bwap.bwap_fused import (
     fused_pruned_mlp,
     fused_pruned_mlp_pool_free,
     gather_ffn_weights,
+    silu_and_mul,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -246,6 +247,10 @@ class BWAPManager:
         # FFN INPUT recorded inside the captured graph, so after a replay we can read
         # back (input, output) per layer and compare the output to an eager recompute.
         self._x_buf: Dict[str, torch.Tensor] = {}  # [max_bs, hidden] replayed FFN input
+        # Snapshots of the read-only weight buffers taken at capture — if they DRIFT
+        # by check time, SGLang reused their memory (unregistered-buffer clobber).
+        self._snap_gu: Dict[str, torch.Tensor] = {}
+        self._snap_dn: Dict[str, torch.Tensor] = {}
         self._divergence_done = False
         self._decode_since_gate = 0
         self._gathered_version: Dict[str, int] = {}  # mask_version the buffers reflect
@@ -568,6 +573,8 @@ class BWAPManager:
                 self._x_buf[name] = torch.empty(
                     max_bs, hidden, device=weight.device, dtype=weight.dtype
                 )
+                self._snap_gu[name] = self._gate_up_buf[name].clone()
+                self._snap_dn[name] = self._down_buf[name].clone()
         self._capture_force = True
         # Warm the k-width GEMM shapes OUTSIDE the graph. SGLang's eager run-once
         # warms only the DENSE FFN shapes, so these novel reduced-width (k<D_ff)
@@ -667,58 +674,65 @@ class BWAPManager:
         )
 
     def _check_divergence(self, t: int = 1) -> None:
-        """Localize the in-model graph-replay corruption using the persistent buffers
-        that survive replay. For each layer, `_x_buf` holds the FFN INPUT the replay
-        saw and `_out_buf` its OUTPUT; recompute the FFN eagerly (same function, same
-        baked weights) on that input and compare. Three diagnosable outcomes:
-          - input already non-finite/garbage -> corruption is UPSTREAM of the FFN
-            (attention/norm/residual under replay), the FFN is a victim;
-          - output != eager(input) -> the FFN op itself is wrong under replay;
-          - both fine -> FFN correct under replay; corruption is in propagation.
+        """Localize the in-model graph-replay corruption per STAGE, using the
+        persistent buffers that survive replay.
+
+        For each layer we have (from the replay): `_x_buf` = FFN input, `_gu_int` =
+        first-GEMM output, `_z_int` = activation, `_out_buf` = FFN output. We also
+        snapshotted the read-only weight buffers at capture. At check time:
+          - WEIGHT DRIFT (gate_up/down changed since capture) => SGLang reused our
+            unregistered read-only buffers' memory => root cause is buffer clobber;
+          - else recompute each stage eagerly on `_x_buf` (current weights) and see
+            which stage the replay first diverges at (first GEMM / silu / down GEMM).
         """
         logger.info(
-            "BWAP divergence probe: replay-buffer vs eager(same input), first %d row(s)",
-            t,
+            "BWAP divergence probe: weight-drift + per-stage, first %d row(s)", t
         )
-        n_layers = n_diverge = n_bad_input = 0
+        n = drift = d1 = d2 = d3 = 0
         for name in self.gated_mlps:
             if not self._fast_ok.get(name, False) or name not in self._x_buf:
                 continue
-            n_layers += 1
+            n += 1
             x = self._x_buf[name][:t]
-            eager_out = fused_pruned_mlp_pool_free(
-                x,
-                self._gate_up_buf[name],
-                self._down_buf[name],
-                gate_up_buf=torch.empty_like(self._gu_int[name][:t]),
-                z_buf=torch.empty_like(self._z_int[name][:t]),
-                out=torch.empty_like(self._out_buf[name][:t]),
+            gub, dnb = self._gate_up_buf[name], self._down_buf[name]
+            gu_drift = (gub.float() - self._snap_gu[name].float()).abs().max().item()
+            dn_drift = (dnb.float() - self._snap_dn[name].float()).abs().max().item()
+            eager_gu = torch.matmul(x, gub.t())
+            eager_z = silu_and_mul(eager_gu)
+            eager_out = torch.matmul(eager_z, dnb.t())
+            diff_gu = (
+                (self._gu_int[name][:t].float() - eager_gu.float()).abs().max().item()
             )
-            replay_out = self._out_buf[name][:t]
-            x_finite = bool(torch.isfinite(x).all().item())
-            out_finite = bool(torch.isfinite(replay_out).all().item())
-            out_diff = (replay_out.float() - eager_out.float()).abs().max().item()
-            x_norm = x.float().norm().item()
-            diverges = (not out_finite) or out_diff > 1e-2
-            n_diverge += int(diverges)
-            n_bad_input += int(not x_finite)
-            if diverges or not x_finite:
+            diff_z = (
+                (self._z_int[name][:t].float() - eager_z.float()).abs().max().item()
+            )
+            diff_out = (
+                (self._out_buf[name][:t].float() - eager_out.float()).abs().max().item()
+            )
+            w_drifted = max(gu_drift, dn_drift) > 1e-3
+            drift += int(w_drifted)
+            d1 += int(diff_gu > 1e-2)
+            d2 += int(diff_z > 1e-2)
+            d3 += int(diff_out > 1e-2)
+            if w_drifted or diff_gu > 1e-2 or diff_out > 1e-2:
                 logger.info(
-                    "  [%s] x_finite=%s x_norm=%.4g | out_finite=%s "
-                    "|replay_out - eager(x)|max=%.4g -> %s",
+                    "  [%s] w_drift(gu=%.3g dn=%.3g) | stage-diff firstGEMM=%.3g "
+                    "silu=%.3g downGEMM=%.3g",
                     name,
-                    x_finite,
-                    x_norm,
-                    out_finite,
-                    out_diff,
-                    "INPUT BAD (upstream)" if not x_finite else "FFN OP DIVERGES",
+                    gu_drift,
+                    dn_drift,
+                    diff_gu,
+                    diff_z,
+                    diff_out,
                 )
         logger.info(
-            "BWAP divergence probe SUMMARY: %d layers; %d with bad INPUT (upstream); "
-            "%d whose FFN OUTPUT diverges from eager(same input).",
-            n_layers,
-            n_bad_input,
-            n_diverge,
+            "BWAP divergence probe SUMMARY: %d layers | %d weight-DRIFT (buffer "
+            "clobber) | first-GEMM diverges %d | silu diverges %d | down-GEMM diverges %d",
+            n,
+            drift,
+            d1,
+            d2,
+            d3,
         )
 
     def register_graph_buffers(self, registry) -> None:
