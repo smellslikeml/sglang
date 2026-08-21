@@ -24,6 +24,7 @@ from sglang.srt.bwap.bwap_fused import (
     fast_path_eligible,
     fused_pruned_mlp,
     fused_pruned_mlp_into,
+    fused_pruned_mlp_pool_free,
     gather_ffn_weights,
     silu_and_mul,
 )
@@ -286,6 +287,23 @@ class TestBWAPFused(CustomTestCase):
         y_into = fused_pruned_mlp_into(x, gate_up_k, down_k, out=out[: x.shape[0]])
         torch.testing.assert_close(y_into, y_fused, rtol=1e-5, atol=1e-6)
         self.assertEqual(y_into.data_ptr(), out.data_ptr())  # wrote into the buffer
+
+        # Derived property: the fully pool-free variant (gate_up + activation + out
+        # all in caller-owned buffers, in-place silu) computes the identical value.
+        # Guards the in-place silu expansion (g*sigmoid(g)) and the buffered matmuls.
+        gu_buf = torch.empty(8, 2 * k)
+        z_buf = torch.empty(8, k)
+        o_buf = torch.empty(8, hid)
+        y_pf = fused_pruned_mlp_pool_free(
+            x,
+            gate_up_k,
+            down_k,
+            gate_up_buf=gu_buf[: x.shape[0]],
+            z_buf=z_buf[: x.shape[0]],
+            out=o_buf[: x.shape[0]],
+        )
+        torch.testing.assert_close(y_pf, y_fused, rtol=1e-5, atol=1e-6)
+        self.assertEqual(y_pf.data_ptr(), o_buf.data_ptr())
 
     def test_eligibility_guards(self):
         model = TinyModel()

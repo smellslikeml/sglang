@@ -106,6 +106,34 @@ def fused_pruned_mlp_into(
     return out
 
 
+def fused_pruned_mlp_pool_free(
+    x: torch.Tensor,
+    gate_up_k: torch.Tensor,
+    down_k: torch.Tensor,
+    gate_up_buf: torch.Tensor,
+    z_buf: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Fully pool-free variant: every width-sensitive intermediate (gate_up, the
+    activation z) and the output are written into caller-owned persistent buffers
+    via in-place ops — NO tensor is allocated in the CUDA-graph pool.
+
+    Reduced-width (k < D_ff) intermediates are sizes that appear nowhere else in
+    the model, so the shared graph pool reuses/clobbers them across layers on
+    replay (full-width == dense sizes, which the pool handles; that is the only
+    case that worked). Writing them into persistent buffers keeps them stable
+    across replay. silu is expanded to g*sigmoid(g) so it too runs in place.
+    """
+    torch.matmul(x, gate_up_k.t(), out=gate_up_buf)  # [T, 2k]
+    d = gate_up_buf.shape[-1] // 2
+    g = gate_up_buf[:, :d]  # [T, k]  gate
+    up = gate_up_buf[:, d:]  # [T, k]  up
+    torch.sigmoid(g, out=z_buf)  # z = sigmoid(g)
+    z_buf.mul_(g).mul_(up)  # z = silu(g) * up, in place
+    torch.matmul(z_buf, down_k.t(), out=out)  # [T, hidden] -> persistent buffer
+    return out
+
+
 def fast_path_eligible(gate_up_proj, down_proj, tp_size: int) -> bool:
     """Whether the gather-GEMM fast path is valid for this layer.
 

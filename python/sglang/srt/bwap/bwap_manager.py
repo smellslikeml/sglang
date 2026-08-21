@@ -76,7 +76,7 @@ import torch
 from sglang.srt.bwap.bwap_fused import (
     fast_path_eligible,
     fused_pruned_mlp,
-    fused_pruned_mlp_into,
+    fused_pruned_mlp_pool_free,
     gather_ffn_weights,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -236,6 +236,12 @@ class BWAPManager:
         # layer (feeds the next residual add) and a pool tensor gets clobbered across
         # layers on replay (garbage independent of weights). See fused_pruned_mlp_into.
         self._out_buf: Dict[str, torch.Tensor] = {}  # [max_bs, hidden] stable output
+        # Persistent reduced-width intermediates for the pool-free captured path:
+        # [max_bs, 2k] gate_up and [max_bs, k] activation. These odd (k<D_ff) sizes
+        # get clobbered by the shared graph pool across layers on replay; buffering
+        # them keeps the captured pruned FFN correct.
+        self._gu_int: Dict[str, torch.Tensor] = {}  # [max_bs, 2k] gate_up scratch
+        self._z_int: Dict[str, torch.Tensor] = {}  # [max_bs, k] activation scratch
         self._gathered_version: Dict[str, int] = {}  # mask_version the buffers reflect
         self._orig_forwards: Dict[str, Callable] = {}  # saved mlp.forward for teardown
         # Phase-2b throughput probe: when set (only around decode-graph capture),
@@ -461,11 +467,14 @@ class BWAPManager:
             # CUDA graph traces, so its output MUST go to the persistent out_buf
             # (a pool-allocated output is clobbered across layers on replay).
             if self._capture_force and self._fast_ok.get(name, False):
-                return fused_pruned_mlp_into(
+                t = x.shape[0]
+                return fused_pruned_mlp_pool_free(
                     x,
                     self._gate_up_buf[name],
                     self._down_buf[name],
-                    out=self._out_buf[name][: x.shape[0]],
+                    gate_up_buf=self._gu_int[name][:t],
+                    z_buf=self._z_int[name][:t],
+                    out=self._out_buf[name][:t],
                 )
             if (
                 self._phase is _Phase.DECODE
@@ -533,6 +542,12 @@ class BWAPManager:
             self._down_buf[name] = down_k.contiguous()
             self._out_buf[name] = torch.empty(
                 max_bs, hidden, device=weight.device, dtype=weight.dtype
+            )
+            self._gu_int[name] = torch.empty(
+                max_bs, 2 * k, device=weight.device, dtype=weight.dtype
+            )
+            self._z_int[name] = torch.empty(
+                max_bs, k, device=weight.device, dtype=weight.dtype
             )
         self._capture_force = True
         if self._gate_up_buf:
