@@ -504,7 +504,13 @@ class BWAPManager:
                     name in self._out_snap
                 ):  # snapshot output before the residual frees it
                     self._out_snap[name][:t].copy_(result)
-                return result
+                # Return a FRESH graph-tracked tensor, not our persistent out_buf: the
+                # FFN output must cross the layer boundary to the residual add, and an
+                # externally-allocated buffer isn't liveness-tracked by the graph's
+                # memory planner, so its memory is reused before the residual reads it
+                # (the FFN computes correctly — snapshot proves it — but the value is
+                # clobbered in transit). A fresh clone is pool-tracked, like dense down_proj.
+                return result.clone()
             if (
                 self._phase is _Phase.DECODE
                 and self._all_prune
