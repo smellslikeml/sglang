@@ -245,6 +245,12 @@ class BWAPManager:
         self._graph_gated = False  # armed only for real 2b (graph + fused, non-probe)
         self._decode_forwards = 0
         self._warmup_steps = t_init
+        # Real (post-warmup) gathered weights, source for the registry post_fill
+        # that copies them into the graph-resident buffers on the replay stream —
+        # a bare copy_ in init_new isn't visible to the captured graph.
+        self._real_gate_up: Dict[str, torch.Tensor] = {}
+        self._real_down: Dict[str, torch.Tensor] = {}
+        self._graph_buffers_registered = False
 
         # Row-step accounting for realized_sparsity (a row-step is one request
         # advanced one decode step; prompt/exploration row-steps are never pruned).
@@ -508,9 +514,10 @@ class BWAPManager:
         )
 
     def _freeze_and_fill(self) -> None:
-        """Freeze the current (warmed-up) mask into the fixed-address buffers and
-        open the graph gate. The buffers already exist (dummy-filled at capture);
-        copy_ keeps their addresses so the captured graph reads the real weights."""
+        """Freeze the warmed-up mask: stash the real gathered weights as the source
+        the registry post_fill copies into the graph buffers each replay, and open
+        the gate. (The captured graph reads _gate_up_buf/_down_buf; a bare copy_ into
+        them from here isn't visible on replay — post_fill on the replay stream is.)"""
         for name, mlp in self.gated_mlps.items():
             if not self._fast_ok.get(name, False):
                 continue
@@ -520,15 +527,60 @@ class BWAPManager:
             gate_up_k, down_k = gather_ffn_weights(
                 mlp.gate_up_proj.weight, weight, keep_idx, weight.shape[1]
             )
-            if name not in self._gate_up_buf:  # normally pre-allocated at capture
-                self._gate_up_buf[name] = torch.empty_like(gate_up_k)
-                self._down_buf[name] = torch.empty_like(down_k)
-            self._gate_up_buf[name].copy_(gate_up_k)
-            self._down_buf[name].copy_(down_k)
+            self._real_gate_up[name] = gate_up_k.contiguous()
+            self._real_down[name] = down_k.contiguous()
+            # Also fill the graph buffers now so the eager path (graphs disabled)
+            # and the first post-freeze replay are correct even before a post_fill.
+            if name in self._gate_up_buf:
+                self._gate_up_buf[name].copy_(self._real_gate_up[name])
+                self._down_buf[name].copy_(self._real_down[name])
         self._graph_ready = True
         logger.info(
             "BWAP: warmup complete (%d decode forwards) — froze mask, opened graph gate.",
             self._decode_forwards,
+        )
+
+    def register_graph_buffers(self, registry) -> None:
+        """Bind the gathered-weight buffers into SGLang's CUDA-graph buffer registry
+        with a post_fill that copies the frozen real weights in on the replay stream.
+        This is what makes post-capture buffer updates visible to the replayed graph
+        (a bare copy_ is not). Called once from the decode runner before capture."""
+        if self._graph_buffers_registered:
+            return
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import GraphSlot
+
+        def _make_post_fill(src: Dict[str, torch.Tensor], key: str):
+            # No-op until warmup fills `src`; then copy the frozen weights into the
+            # graph buffer on the replay stream (what makes them visible on replay).
+            def fill(buffer, forward_batch, ctx):
+                real = src.get(key)
+                if real is not None:
+                    buffer.copy_(real)
+
+            return fill
+
+        for name in self.gated_mlps:
+            if not self._fast_ok.get(name, False):
+                continue
+            for tag, buf, src in (
+                ("gate_up", self._gate_up_buf[name], self._real_gate_up),
+                ("down", self._down_buf[name], self._real_down),
+            ):
+                shape = tuple(buf.shape)
+                registry.register_slot(
+                    GraphSlot(
+                        name=f"bwap.{tag}.{name}",
+                        shape_fn=lambda mb, mt, s=shape: s,
+                        dtype=buf.dtype,
+                        device=buf.device,
+                        copy_from_fb=False,
+                        post_fill=_make_post_fill(src, name),
+                    ),
+                    bind=buf,
+                )
+        self._graph_buffers_registered = True
+        logger.info(
+            "BWAP: registered %d graph-resident buffers.", 2 * len(self._gate_up_buf)
         )
 
     def _fast_mlp_forward(
