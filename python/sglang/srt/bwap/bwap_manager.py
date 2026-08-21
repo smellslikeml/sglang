@@ -573,6 +573,10 @@ class BWAPManager:
                     self._post_fill_logged = True
                 if real is not None:
                     buffer.copy_(real)
+                    # DIAGNOSTIC: force the copy to complete before the graph
+                    # replays. If this fixes correctness, post_fill was racing the
+                    # replay on a different stream (fix: copy on the replay stream).
+                    torch.cuda.synchronize()
 
             return fill
 
