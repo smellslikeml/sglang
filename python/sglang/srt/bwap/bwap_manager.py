@@ -247,6 +247,10 @@ class BWAPManager:
         # FFN INPUT recorded inside the captured graph, so after a replay we can read
         # back (input, output) per layer and compare the output to an eager recompute.
         self._x_buf: Dict[str, torch.Tensor] = {}  # [max_bs, hidden] replayed FFN input
+        # Snapshot of the FFN OUTPUT taken IN-GRAPH right after the down GEMM, into a
+        # buffer with no in-graph consumer -> the allocator can't free/reuse it, so it
+        # holds the true down-GEMM result (vs _out_buf, which the residual frees).
+        self._out_snap: Dict[str, torch.Tensor] = {}
         # Snapshots of the read-only weight buffers taken at capture — if they DRIFT
         # by check time, SGLang reused their memory (unregistered-buffer clobber).
         self._snap_gu: Dict[str, torch.Tensor] = {}
@@ -488,7 +492,7 @@ class BWAPManager:
                 t = x.shape[0]
                 if name in self._x_buf:  # divergence probe: record FFN input in-graph
                     self._x_buf[name][:t].copy_(x)
-                return fused_pruned_mlp_pool_free(
+                result = fused_pruned_mlp_pool_free(
                     x,
                     self._gate_up_buf[name],
                     self._down_buf[name],
@@ -496,6 +500,11 @@ class BWAPManager:
                     z_buf=self._z_int[name][:t],
                     out=self._out_buf[name][:t],
                 )
+                if (
+                    name in self._out_snap
+                ):  # snapshot output before the residual frees it
+                    self._out_snap[name][:t].copy_(result)
+                return result
             if (
                 self._phase is _Phase.DECODE
                 and self._all_prune
@@ -575,6 +584,9 @@ class BWAPManager:
                 )
                 self._snap_gu[name] = self._gate_up_buf[name].clone()
                 self._snap_dn[name] = self._down_buf[name].clone()
+                self._out_snap[name] = torch.empty(
+                    max_bs, hidden, device=weight.device, dtype=weight.dtype
+                )
         self._capture_force = True
         # Warm the k-width GEMM shapes OUTSIDE the graph. SGLang's eager run-once
         # warms only the DENSE FFN shapes, so these novel reduced-width (k<D_ff)
@@ -688,7 +700,7 @@ class BWAPManager:
         logger.info(
             "BWAP divergence probe: weight-drift + per-stage, first %d row(s)", t
         )
-        n = drift = d1 = d2 = d3 = 0
+        n = drift = d1 = d2 = d3 = d4 = 0
         for name in self.gated_mlps:
             if not self._fast_ok.get(name, False) or name not in self._x_buf:
                 continue
@@ -706,33 +718,44 @@ class BWAPManager:
             diff_z = (
                 (self._z_int[name][:t].float() - eager_z.float()).abs().max().item()
             )
+            # out_buf: read late (residual may have freed+reused its memory)
             diff_out = (
                 (self._out_buf[name][:t].float() - eager_out.float()).abs().max().item()
+            )
+            # out_snap: taken in-graph with no consumer -> the TRUE down-GEMM output
+            diff_snap = (
+                (self._out_snap[name][:t].float() - eager_out.float())
+                .abs()
+                .max()
+                .item()
             )
             w_drifted = max(gu_drift, dn_drift) > 1e-3
             drift += int(w_drifted)
             d1 += int(diff_gu > 1e-2)
             d2 += int(diff_z > 1e-2)
             d3 += int(diff_out > 1e-2)
+            d4 += int(diff_snap > 1e-2)
             if w_drifted or diff_gu > 1e-2 or diff_out > 1e-2:
                 logger.info(
-                    "  [%s] w_drift(gu=%.3g dn=%.3g) | stage-diff firstGEMM=%.3g "
-                    "silu=%.3g downGEMM=%.3g",
+                    "  [%s] w_drift(gu=%.3g dn=%.3g) | firstGEMM=%.3g silu=%.3g "
+                    "downGEMM(out_buf late)=%.3g downGEMM(snapshot)=%.3g",
                     name,
                     gu_drift,
                     dn_drift,
                     diff_gu,
                     diff_z,
                     diff_out,
+                    diff_snap,
                 )
         logger.info(
-            "BWAP divergence probe SUMMARY: %d layers | %d weight-DRIFT (buffer "
-            "clobber) | first-GEMM diverges %d | silu diverges %d | down-GEMM diverges %d",
+            "BWAP divergence probe SUMMARY: %d layers | %d weight-DRIFT | firstGEMM "
+            "div %d | silu div %d | out_buf(late) div %d | out_snap(TRUE) div %d",
             n,
             drift,
             d1,
             d2,
             d3,
+            d4,
         )
 
     def register_graph_buffers(self, registry) -> None:
