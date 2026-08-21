@@ -68,6 +68,7 @@ accuracy-retention, and realized sparsity, not throughput.
 import enum
 import logging
 import math
+import os
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -492,6 +493,14 @@ class BWAPManager:
         - out: persistent [max_bs, hidden] output buffers (``max_bs`` is the largest
           captured decode batch), sliced to the batch's token count each forward.
         """
+        # Validation hook: bake a real BWAP mask captured from a prior eager warmup
+        # (BWAP_DUMP_MASK) so the graph runs on the activation-based adaptive mask,
+        # not the data-free magnitude proxy. Confirms the machinery + a good mask =
+        # correct + fast, sidestepping the (non-working) runtime refresh path.
+        load_path = os.environ.get("BWAP_LOAD_MASK")
+        loaded_masks = (
+            torch.load(load_path) if load_path and os.path.exists(load_path) else None
+        )
         for name, mlp in self.gated_mlps.items():
             if not self._fast_ok.get(name, False):
                 continue
@@ -506,8 +515,17 @@ class BWAPManager:
             # baked at capture are), so a sensible static mask here is what makes the
             # graph correct — an arbitrary first-k slice yielded garbage. The perf
             # probe uses this too (k is unchanged, so throughput is identical).
-            importance = weight.norm(dim=0)  # [d_ff] = ||down_proj[:, j]||
-            keep_idx = torch.topk(importance, k).indices.sort().values
+            if loaded_masks is not None and name in loaded_masks:
+                keep_idx = (
+                    loaded_masks[name]
+                    .to(weight.device)
+                    .bool()
+                    .nonzero(as_tuple=False)
+                    .squeeze(-1)
+                )
+            else:
+                importance = weight.norm(dim=0)  # [d_ff] = ||down_proj[:, j]||
+                keep_idx = torch.topk(importance, k).indices.sort().values
             gate_up_k, down_k = gather_ffn_weights(
                 mlp.gate_up_proj.weight, weight, keep_idx, d_ff
             )
@@ -574,6 +592,15 @@ class BWAPManager:
             if name in self._gate_up_buf:
                 self._gate_up_buf[name].copy_(self._real_gate_up[name])
                 self._down_buf[name].copy_(self._real_down[name])
+        # Validation hook: persist the frozen adaptive masks so a subsequent graph
+        # run can bake them at capture (BWAP_LOAD_MASK) — the machinery + real-mask
+        # end-to-end test that the non-working runtime refresh otherwise blocks.
+        dump_path = os.environ.get("BWAP_DUMP_MASK")
+        if dump_path:
+            torch.save({n: m.detach().cpu() for n, m in self.masks.items()}, dump_path)
+            logger.info(
+                "BWAP: dumped %d frozen masks to %s", len(self.masks), dump_path
+            )
         self._graph_ready = True  # open the gate: captured pruned graph is now valid
         logger.info(
             "BWAP: warmup complete (%d decode forwards) — froze mask, opened graph gate.",
