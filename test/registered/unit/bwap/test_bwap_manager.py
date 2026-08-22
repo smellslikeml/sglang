@@ -387,12 +387,13 @@ class TestBWAPFused(CustomTestCase):
         self.assertIn(key, mgr._gate_up_buf)  # buffers filled from the real mask
         self.assertEqual(int(mgr.masks[key].sum().item()), INTERMEDIATE // 2)
 
-    def test_capture_allocates_stable_output_buffer(self):
-        # Bug regression (Phase 2b 2%-accuracy): the captured pruned FFN must write
-        # into a persistent [max_bs, hidden] output buffer allocated before capture,
-        # NOT a fresh (pool-allocated) tensor — a pool output is clobbered across
-        # layers on replay, giving garbage independent of the weights. Guards that
-        # begin_capture allocates the buffer and the captured branch writes into it.
+    def test_capture_branch_returns_fresh_correct_output(self):
+        # Bug regression (Phase 2b propagation clobber): the captured branch computes
+        # into persistent scratch but must RETURN A FRESH tensor, not the persistent
+        # out_buf. The in-graph snapshot probe proved the FFN computes correctly, but
+        # returning the external out_buf let the graph reuse its memory before the
+        # residual add consumed it (garbage in transit). Guard: capture branch returns
+        # (a) a tensor distinct from out_buf's storage and (b) the correct FFN value.
         model = TinyModel()
         mgr = BWAPManager(
             base_model=model,
@@ -409,13 +410,16 @@ class TestBWAPFused(CustomTestCase):
         try:
             out_buf = mgr._out_buf[key]
             self.assertEqual(out_buf.shape, (8, HIDDEN))  # [max_bs, hidden]
-            # _capture_force is set: the wrapper's capture branch runs and must
-            # return a view into the persistent out_buf (T rows), not a fresh tensor.
             x = torch.randn(4, HIDDEN)
             with torch.no_grad():
                 y = model.mlp(x)
-            self.assertEqual(y.data_ptr(), out_buf.data_ptr())  # wrote into out_buf
             self.assertEqual(y.shape, (4, HIDDEN))
+            # Fresh tensor, not aliasing out_buf (so the graph can't clobber it).
+            self.assertNotEqual(y.data_ptr(), out_buf.data_ptr())
+            # ...but the value equals the gather-GEMM over the baked buffers.
+            gate_up_k, down_k = mgr._gate_up_buf[key], mgr._down_buf[key]
+            ref = F.linear(silu_and_mul(F.linear(x, gate_up_k)), down_k)
+            torch.testing.assert_close(y, ref, rtol=1e-4, atol=1e-5)
         finally:
             mgr.end_capture()
             mgr.remove_fused_forwards()
