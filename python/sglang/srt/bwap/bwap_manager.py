@@ -285,6 +285,10 @@ class BWAPManager:
         self._real_gate_up: Dict[str, torch.Tensor] = {}
         self._real_down: Dict[str, torch.Tensor] = {}
         self._real_version: Dict[str, int] = {}  # mask_version _real reflects
+        self._delivered: Dict[Tuple[str, str], int] = (
+            {}
+        )  # (tag,name)->version in graph buf
+        self._regather_count = 0
         self._graph_buffers_registered = False
 
         # Row-step accounting for realized_sparsity (a row-step is one request
@@ -695,11 +699,18 @@ class BWAPManager:
                 )
                 self._real_gate_up[name] = gate_up_k.contiguous()
                 self._real_down[name] = down_k.contiguous()
-                # Seed the graph buffers directly too (first replay, before post_fill).
-                if name in self._gate_up_buf:
-                    self._gate_up_buf[name].copy_(self._real_gate_up[name])
-                    self._down_buf[name].copy_(self._real_down[name])
+                # Delivery to the graph buffers is the registry post_fill's job (it
+                # runs on the replay stream); it copies only when the version advances.
                 self._real_version[name] = self.mask_version.get(name, 0)
+                self._regather_count += 1
+                if self._regather_count <= 5 or self._regather_count % 100 == 0:
+                    logger.info(
+                        "BWAP graph mask refresh #%d: %s v=%d mask_sum=%d",
+                        self._regather_count,
+                        name,
+                        self._real_version[name],
+                        int(self.masks[name].sum().item()),
+                    )
         return ready
 
     def log_ge_compare(
@@ -821,23 +832,20 @@ class BWAPManager:
             return
         from sglang.srt.model_executor.cuda_graph_buffer_registry import GraphSlot
 
-        self._post_fill_logged = False
-
-        def _make_post_fill(src: Dict[str, torch.Tensor], key: str):
-            # No-op until warmup fills `src`; then copy the frozen weights into the
-            # graph buffer on the replay stream (what makes them visible on replay).
+        def _make_post_fill(src: Dict[str, torch.Tensor], key: str, tag: str):
+            # Copy the current adaptive gathered weights into the graph buffer on the
+            # REPLAY STREAM (visible to replay; a compute-stream copy may not be), but
+            # ONLY when the mask version advanced since we last delivered this slot —
+            # so steady prune steps within a cycle are a cheap no-op, not a full copy.
             def fill(buffer, forward_batch, ctx):
                 real = src.get(key)
-                if not self._post_fill_logged:
-                    logger.info(
-                        "BWAP post_fill: real_present=%s buf_ptr=%x shape=%s",
-                        real is not None,
-                        buffer.data_ptr(),
-                        tuple(buffer.shape),
-                    )
-                    self._post_fill_logged = True
-                if real is not None:
-                    buffer.copy_(real)
+                if real is None:
+                    return
+                v = self._real_version.get(key, -1)
+                if self._delivered.get((tag, key)) == v:
+                    return  # graph buffer already holds this mask version
+                buffer.copy_(real)
+                self._delivered[(tag, key)] = v
 
             return fill
 
@@ -857,7 +865,7 @@ class BWAPManager:
                         device=buf.device,
                         axis="none",  # fixed weight buffers, NOT token-indexed — don't slice
                         copy_from_fb=False,
-                        post_fill=_make_post_fill(src, name),
+                        post_fill=_make_post_fill(src, name, tag),
                     ),
                     bind=buf,
                 )
