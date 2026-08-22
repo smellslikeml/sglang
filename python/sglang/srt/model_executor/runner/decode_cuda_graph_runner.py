@@ -1441,6 +1441,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.POST_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+        # BWAP graph-vs-eager divergence probe (debug, env-gated, single-stream): run
+        # a shadow eager forward on the SAME batch and diff it against this replay.
+        bwap = self.model_runner.bwap_manager
+        if (
+            bwap is not None
+            and bwap._want_ge_compare
+            and isinstance(output, LogitsProcessorOutput)
+            and output.next_token_logits is not None
+        ):
+            # Clone the graph logits FIRST — they are a view into the shared graph
+            # output buffer that the eager forward will overwrite.
+            g_logits = output.next_token_logits[: self.raw_num_token].clone()
+            bwap._in_shadow = True
+            try:
+                e_out = self.model_runner.eager_runner.execute(
+                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                )
+            finally:
+                bwap._in_shadow = False
+            if (
+                isinstance(e_out, LogitsProcessorOutput)
+                and e_out.next_token_logits is not None
+            ):
+                bwap.log_ge_compare(g_logits, e_out.next_token_logits)
+            bwap._want_ge_compare = False
+
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None

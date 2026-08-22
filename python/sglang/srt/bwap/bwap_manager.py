@@ -247,6 +247,7 @@ class BWAPManager:
         # FFN INPUT recorded inside the captured graph, so after a replay we can read
         # back (input, output) per layer and compare the output to an eager recompute.
         self._x_buf: Dict[str, torch.Tensor] = {}  # [max_bs, hidden] replayed FFN input
+        self._x_eager: Dict[str, torch.Tensor] = {}  # [max_bs, hidden] eager FFN input
         # Snapshot of the FFN OUTPUT taken IN-GRAPH right after the down GEMM, into a
         # buffer with no in-graph consumer -> the allocator can't free/reuse it, so it
         # holds the true down-GEMM result (vs _out_buf, which the residual frees).
@@ -257,6 +258,8 @@ class BWAPManager:
         self._snap_dn: Dict[str, torch.Tensor] = {}
         self._divergence_done = False
         self._decode_since_gate = 0
+        self._in_shadow = False  # running the shadow eager forward for the ge-compare
+        self._want_ge_compare = False  # set once post-gate; runner does the compare
         self._gathered_version: Dict[str, int] = {}  # mask_version the buffers reflect
         self._orig_forwards: Dict[str, Callable] = {}  # saved mlp.forward for teardown
         # Phase-2b throughput probe: when set (only around decode-graph capture),
@@ -319,12 +322,12 @@ class BWAPManager:
             self._all_prune = False
         elif forward_mode.is_decode():
             self._phase = _Phase.DECODE
-            # Divergence probe: after the 2nd decode, the persistent buffers hold the
-            # 1st decode's REPLAYED (input, output) per layer — compare vs eager.
+            # Graph-vs-eager probe: on the 2nd post-gate decode, ask the runner to run
+            # a shadow eager forward on this same batch and diff it against the graph.
             if self._x_buf and not self._divergence_done:
                 self._decode_since_gate += 1
                 if self._decode_since_gate >= 2:
-                    self._check_divergence()
+                    self._want_ge_compare = True
                     self._divergence_done = True
             steps = self._decode_steps(req_pool_indices, seq_lens)
             self._prune_rows, self._collect_rows = compute_row_modes(
@@ -484,6 +487,23 @@ class BWAPManager:
         orig = self._orig_forwards[name]
 
         def forward(x, *args, **kwargs):
+            # Graph-vs-eager compare: a shadow eager forward runs the SAME baked-mask
+            # fused FFN as the captured graph (so any hidden-state divergence is
+            # capture-vs-replay, not a mask difference), recording this layer's FFN
+            # input into _x_eager to diff against the graph's in-graph _x_buf.
+            if self._in_shadow and self._fast_ok.get(name, False):
+                t = x.shape[0]
+                if name in self._x_eager:
+                    self._x_eager[name][:t].copy_(x)
+                result = fused_pruned_mlp_pool_free(
+                    x,
+                    self._gate_up_buf[name],
+                    self._down_buf[name],
+                    gate_up_buf=self._gu_int[name][:t],
+                    z_buf=self._z_int[name][:t],
+                    out=self._out_buf[name][:t],
+                )
+                return result.clone()
             # Capture path: force the gather path over the fixed-address buffers so
             # the decode graph records the k-width pruned FFN. This is the branch the
             # CUDA graph traces, so its output MUST go to the persistent out_buf
@@ -593,6 +613,9 @@ class BWAPManager:
                 self._out_snap[name] = torch.empty(
                     max_bs, hidden, device=weight.device, dtype=weight.dtype
                 )
+                self._x_eager[name] = torch.empty(
+                    max_bs, hidden, device=weight.device, dtype=weight.dtype
+                )
         self._capture_force = True
         # Warm the k-width GEMM shapes OUTSIDE the graph. SGLang's eager run-once
         # warms only the DENSE FFN shapes, so these novel reduced-width (k<D_ff)
@@ -689,6 +712,43 @@ class BWAPManager:
         logger.info(
             "BWAP: warmup complete (%d decode forwards) — froze mask, opened graph gate.",
             self._decode_forwards,
+        )
+
+    def log_ge_compare(
+        self, graph_logits: torch.Tensor, eager_logits: torch.Tensor, t: int = 1
+    ) -> None:
+        """Graph-vs-eager: diff the same-batch graph replay against a shadow eager
+        forward. `graph_logits`/`eager_logits` are the two next-token logits; per
+        layer, `_x_buf` (recorded in-graph during replay) vs `_x_eager` (recorded
+        during the shadow eager forward) are the two FFN inputs. The FIRST layer
+        whose FFN input diverges is where the captured graph corrupts the hidden
+        state; if none diverge and the logits match, the graph is faithful and the
+        accuracy loss is NOT the graph.
+        """
+        m = min(graph_logits.shape[0], eager_logits.shape[0])
+        logit_diff = (
+            (graph_logits[:m].float() - eager_logits[:m].float()).abs().max().item()
+        )
+        first_div = None
+        max_layer_diff = 0.0
+        for i, name in enumerate(self.gated_mlps):
+            if not self._fast_ok.get(name, False) or name not in self._x_eager:
+                continue
+            d = (
+                (self._x_buf[name][:t].float() - self._x_eager[name][:t].float())
+                .abs()
+                .max()
+                .item()
+            )
+            max_layer_diff = max(max_layer_diff, d)
+            if d > 1e-2 and first_div is None:
+                first_div = (i, name, d)
+        logger.info(
+            "BWAP graph-vs-eager: next-token-logits |graph-eager|max=%.4g | "
+            "FFN-input first-divergent-layer=%s | max per-layer FFN-input diff=%.4g",
+            logit_diff,
+            "NONE (graph faithful)" if first_div is None else f"{first_div}",
+            max_layer_diff,
         )
 
     def _check_divergence(self, t: int = 1) -> None:
