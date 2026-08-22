@@ -25,6 +25,7 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.bwap.bwap_manager import BWAPManager
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -658,6 +659,7 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.maybe_init_bwap_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
 
@@ -753,6 +755,25 @@ class ModelRunner:
     def maybe_init_lora_manager(self):
         if get_lora().enable_lora:
             self.init_lora_manager()
+
+    def maybe_init_bwap_manager(self):
+        # Draft workers run their own model; BWAP Phase 1 targets the target
+        # model's decode path only.
+        if self.server_args.enable_bwap and not self.is_draft_worker:
+            self.init_bwap_manager()
+        else:
+            self.bwap_manager = None
+
+    def init_bwap_manager(self):
+        self.bwap_manager = BWAPManager(
+            base_model=self.model,
+            sparsity=self.server_args.bwap_sparsity,
+            t_init=self.server_args.bwap_t_init,
+            t_explore=self.server_args.bwap_t_explore,
+            t_prune=self.server_args.bwap_t_prune,
+            fused=self.server_args.bwap_fused,
+            tp_size=self.ps.tp_size,
+        )
 
     def maybe_enable_batch_invariant_mode(self):
         if get_exec().deterministic.enable_deterministic_inference:

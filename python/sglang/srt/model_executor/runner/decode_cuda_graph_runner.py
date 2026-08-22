@@ -650,6 +650,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        # BWAP Phase 2b: while the mask is still being built (eager warmup), keep
+        # decode eager so the act_fn hooks can collect scores; the captured pruned
+        # graph is only valid once the mask is frozen into its buffers.
+        if (
+            self.model_runner.bwap_manager is not None
+            and self.model_runner.server_args.bwap_fused
+            and not self.model_runner.bwap_manager.graph_ready()
+        ):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
@@ -1028,6 +1038,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # and write KV -- through the previous batch's live values. Replay is
         # already covered by the registry's padding policy.
         self.buffers.reset_index_buffers()
+
+        # BWAP Phase 2b: bind the gathered-weight buffers into this runner's graph
+        # buffer registry (before capture) so a post_fill can make the frozen
+        # weights visible to the replayed graph.
+        if (
+            self.model_runner.bwap_manager is not None
+            and self.model_runner.server_args.bwap_fused
+            and not self.model_runner.server_args.bwap_probe
+        ):
+            self.model_runner.bwap_manager.register_graph_buffers(self.buffer_registry)
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
