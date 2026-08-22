@@ -68,7 +68,6 @@ accuracy-retention, and realized sparsity, not throughput.
 import enum
 import logging
 import math
-import os
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -78,7 +77,6 @@ from sglang.srt.bwap.bwap_fused import (
     fused_pruned_mlp,
     fused_pruned_mlp_pool_free,
     gather_ffn_weights,
-    silu_and_mul,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -243,23 +241,6 @@ class BWAPManager:
         # them keeps the captured pruned FFN correct.
         self._gu_int: Dict[str, torch.Tensor] = {}  # [max_bs, 2k] gate_up scratch
         self._z_int: Dict[str, torch.Tensor] = {}  # [max_bs, k] activation scratch
-        # Divergence probe (BWAP_DIVERGENCE_PROBE): persistent per-layer copy of the
-        # FFN INPUT recorded inside the captured graph, so after a replay we can read
-        # back (input, output) per layer and compare the output to an eager recompute.
-        self._x_buf: Dict[str, torch.Tensor] = {}  # [max_bs, hidden] replayed FFN input
-        self._x_eager: Dict[str, torch.Tensor] = {}  # [max_bs, hidden] eager FFN input
-        # Snapshot of the FFN OUTPUT taken IN-GRAPH right after the down GEMM, into a
-        # buffer with no in-graph consumer -> the allocator can't free/reuse it, so it
-        # holds the true down-GEMM result (vs _out_buf, which the residual frees).
-        self._out_snap: Dict[str, torch.Tensor] = {}
-        # Snapshots of the read-only weight buffers taken at capture — if they DRIFT
-        # by check time, SGLang reused their memory (unregistered-buffer clobber).
-        self._snap_gu: Dict[str, torch.Tensor] = {}
-        self._snap_dn: Dict[str, torch.Tensor] = {}
-        self._divergence_done = False
-        self._decode_since_gate = 0
-        self._in_shadow = False  # running the shadow eager forward for the ge-compare
-        self._want_ge_compare = False  # set once post-gate; runner does the compare
         self._gathered_version: Dict[str, int] = {}  # mask_version the buffers reflect
         self._orig_forwards: Dict[str, Callable] = {}  # saved mlp.forward for teardown
         # Phase-2b throughput probe: when set (only around decode-graph capture),
@@ -329,13 +310,6 @@ class BWAPManager:
             self._all_prune = False
         elif forward_mode.is_decode():
             self._phase = _Phase.DECODE
-            # Graph-vs-eager probe: on the 2nd post-gate decode, ask the runner to run
-            # a shadow eager forward on this same batch and diff it against the graph.
-            if self._x_buf and not self._divergence_done:
-                self._decode_since_gate += 1
-                if self._decode_since_gate >= 2:
-                    self._want_ge_compare = True
-                    self._divergence_done = True
             steps = self._decode_steps(req_pool_indices, seq_lens)
             self._prune_rows, self._collect_rows = compute_row_modes(
                 steps, t_init=self.t_init, t_prune=self.t_prune, t_trans=self.t_trans
@@ -493,31 +467,14 @@ class BWAPManager:
         orig = self._orig_forwards[name]
 
         def forward(x, *args, **kwargs):
-            # Graph-vs-eager compare: a shadow eager forward runs the SAME baked-mask
-            # fused FFN as the captured graph (so any hidden-state divergence is
-            # capture-vs-replay, not a mask difference), recording this layer's FFN
-            # input into _x_eager to diff against the graph's in-graph _x_buf.
-            if self._in_shadow and self._fast_ok.get(name, False):
-                t = x.shape[0]
-                if name in self._x_eager:
-                    self._x_eager[name][:t].copy_(x)
-                result = fused_pruned_mlp_pool_free(
-                    x,
-                    self._gate_up_buf[name],
-                    self._down_buf[name],
-                    gate_up_buf=self._gu_int[name][:t],
-                    z_buf=self._z_int[name][:t],
-                    out=self._out_buf[name][:t],
-                )
-                return result.clone()
             # Capture path: force the gather path over the fixed-address buffers so
-            # the decode graph records the k-width pruned FFN. This is the branch the
-            # CUDA graph traces, so its output MUST go to the persistent out_buf
-            # (a pool-allocated output is clobbered across layers on replay).
+            # the decode graph records the k-width pruned FFN. Return a FRESH
+            # graph-tracked tensor (clone), not the persistent out_buf: the FFN output
+            # must cross the layer boundary to the residual add, and an
+            # externally-allocated buffer isn't liveness-tracked by the graph's memory
+            # planner, so its storage can be reused before the residual reads it.
             if self._capture_force and self._fast_ok.get(name, False):
                 t = x.shape[0]
-                if name in self._x_buf:  # divergence probe: record FFN input in-graph
-                    self._x_buf[name][:t].copy_(x)
                 result = fused_pruned_mlp_pool_free(
                     x,
                     self._gate_up_buf[name],
@@ -526,16 +483,6 @@ class BWAPManager:
                     z_buf=self._z_int[name][:t],
                     out=self._out_buf[name][:t],
                 )
-                if (
-                    name in self._out_snap
-                ):  # snapshot output before the residual frees it
-                    self._out_snap[name][:t].copy_(result)
-                # Return a FRESH graph-tracked tensor, not our persistent out_buf: the
-                # FFN output must cross the layer boundary to the residual add, and an
-                # externally-allocated buffer isn't liveness-tracked by the graph's
-                # memory planner, so its memory is reused before the residual reads it
-                # (the FFN computes correctly — snapshot proves it — but the value is
-                # clobbered in transit). A fresh clone is pool-tracked, like dense down_proj.
                 return result.clone()
             if (
                 self._phase is _Phase.DECODE
@@ -554,23 +501,16 @@ class BWAPManager:
     def begin_capture(self, *, max_bs: int) -> None:
         """Allocate the fixed-address buffers the captured pruned FFN reads/writes,
         for every eligible layer, and force the gather path so the decode graph
-        captured next runs the k-width pruned FFN. All buffers are allocated here
+        captured next records the k-width pruned FFN. All buffers are allocated here
         (before capture) so no cudaMalloc happens during capture:
 
-        - gate_up/down: dummy gathered weights (first k neurons); the real ones are
-          copied in per replay by the registry post_fill after warmup freezes the
-          mask (probe mode skips the freeze and runs these dummies — perf-only).
-        - out: persistent [max_bs, hidden] output buffers (``max_bs`` is the largest
-          captured decode batch), sliced to the batch's token count each forward.
+        - gate_up/down: gathered weights for an initial (magnitude) mask — this only
+          fixes the graph's k-wide TOPOLOGY. The ADAPTIVE mask's actual weights are
+          delivered into these buffers per cycle by the registry post_fill on the
+          replay stream (see ``register_graph_buffers`` / ``_refresh_graph_masks``).
+        - out/gu/z: persistent output + intermediate scratch, sliced to the batch's
+          token count each forward.
         """
-        # Validation hook: bake a real BWAP mask captured from a prior eager warmup
-        # (BWAP_DUMP_MASK) so the graph runs on the activation-based adaptive mask,
-        # not the data-free magnitude proxy. Confirms the machinery + a good mask =
-        # correct + fast, sidestepping the (non-working) runtime refresh path.
-        load_path = os.environ.get("BWAP_LOAD_MASK")
-        loaded_masks = (
-            torch.load(load_path) if load_path and os.path.exists(load_path) else None
-        )
         for name, mlp in self.gated_mlps.items():
             if not self._fast_ok.get(name, False):
                 continue
@@ -578,24 +518,11 @@ class BWAPManager:
             d_ff = weight.shape[1]
             hidden = weight.shape[0]
             k = int(round((1.0 - self.sparsity) * d_ff))
-            # Data-free importance: keep the k neurons whose down_proj column has
-            # the largest L2 norm (a standard magnitude proxy). This is the mask the
-            # captured graph runs on: the runtime post_fill/refresh of the adaptive
-            # mask is NOT reflected by the replayed full-model graph (only weights
-            # baked at capture are), so a sensible static mask here is what makes the
-            # graph correct — an arbitrary first-k slice yielded garbage. The perf
-            # probe uses this too (k is unchanged, so throughput is identical).
-            if loaded_masks is not None and name in loaded_masks:
-                keep_idx = (
-                    loaded_masks[name]
-                    .to(weight.device)
-                    .bool()
-                    .nonzero(as_tuple=False)
-                    .squeeze(-1)
-                )
-            else:
-                importance = weight.norm(dim=0)  # [d_ff] = ||down_proj[:, j]||
-                keep_idx = torch.topk(importance, k).indices.sort().values
+            # Initial capture mask: data-free magnitude proxy (top-k down_proj column
+            # L2 norm). Overwritten by the adaptive mask via post_fill once decoding
+            # starts; here it only pins the k-wide topology the graph captures.
+            importance = weight.norm(dim=0)  # [d_ff] = ||down_proj[:, j]||
+            keep_idx = torch.topk(importance, k).indices.sort().values
             gate_up_k, down_k = gather_ffn_weights(
                 mlp.gate_up_proj.weight, weight, keep_idx, d_ff
             )
@@ -610,18 +537,6 @@ class BWAPManager:
             self._z_int[name] = torch.empty(
                 max_bs, k, device=weight.device, dtype=weight.dtype
             )
-            if os.environ.get("BWAP_DIVERGENCE_PROBE"):
-                self._x_buf[name] = torch.empty(
-                    max_bs, hidden, device=weight.device, dtype=weight.dtype
-                )
-                self._snap_gu[name] = self._gate_up_buf[name].clone()
-                self._snap_dn[name] = self._down_buf[name].clone()
-                self._out_snap[name] = torch.empty(
-                    max_bs, hidden, device=weight.device, dtype=weight.dtype
-                )
-                self._x_eager[name] = torch.empty(
-                    max_bs, hidden, device=weight.device, dtype=weight.dtype
-                )
         self._capture_force = True
         # Warm the k-width GEMM shapes OUTSIDE the graph. SGLang's eager run-once
         # warms only the DENSE FFN shapes, so these novel reduced-width (k<D_ff)
@@ -713,121 +628,12 @@ class BWAPManager:
                     )
         return ready
 
-    def log_ge_compare(
-        self, graph_logits: torch.Tensor, eager_logits: torch.Tensor, t: int = 1
-    ) -> None:
-        """Graph-vs-eager: diff the same-batch graph replay against a shadow eager
-        forward. `graph_logits`/`eager_logits` are the two next-token logits; per
-        layer, `_x_buf` (recorded in-graph during replay) vs `_x_eager` (recorded
-        during the shadow eager forward) are the two FFN inputs. The FIRST layer
-        whose FFN input diverges is where the captured graph corrupts the hidden
-        state; if none diverge and the logits match, the graph is faithful and the
-        accuracy loss is NOT the graph.
-        """
-        m = min(graph_logits.shape[0], eager_logits.shape[0])
-        logit_diff = (
-            (graph_logits[:m].float() - eager_logits[:m].float()).abs().max().item()
-        )
-        first_div = None
-        max_layer_diff = 0.0
-        for i, name in enumerate(self.gated_mlps):
-            if not self._fast_ok.get(name, False) or name not in self._x_eager:
-                continue
-            d = (
-                (self._x_buf[name][:t].float() - self._x_eager[name][:t].float())
-                .abs()
-                .max()
-                .item()
-            )
-            max_layer_diff = max(max_layer_diff, d)
-            if d > 1e-2 and first_div is None:
-                first_div = (i, name, d)
-        logger.info(
-            "BWAP graph-vs-eager: next-token-logits |graph-eager|max=%.4g | "
-            "FFN-input first-divergent-layer=%s | max per-layer FFN-input diff=%.4g",
-            logit_diff,
-            "NONE (graph faithful)" if first_div is None else f"{first_div}",
-            max_layer_diff,
-        )
-
-    def _check_divergence(self, t: int = 1) -> None:
-        """Localize the in-model graph-replay corruption per STAGE, using the
-        persistent buffers that survive replay.
-
-        For each layer we have (from the replay): `_x_buf` = FFN input, `_gu_int` =
-        first-GEMM output, `_z_int` = activation, `_out_buf` = FFN output. We also
-        snapshotted the read-only weight buffers at capture. At check time:
-          - WEIGHT DRIFT (gate_up/down changed since capture) => SGLang reused our
-            unregistered read-only buffers' memory => root cause is buffer clobber;
-          - else recompute each stage eagerly on `_x_buf` (current weights) and see
-            which stage the replay first diverges at (first GEMM / silu / down GEMM).
-        """
-        logger.info(
-            "BWAP divergence probe: weight-drift + per-stage, first %d row(s)", t
-        )
-        n = drift = d1 = d2 = d3 = d4 = 0
-        for name in self.gated_mlps:
-            if not self._fast_ok.get(name, False) or name not in self._x_buf:
-                continue
-            n += 1
-            x = self._x_buf[name][:t]
-            gub, dnb = self._gate_up_buf[name], self._down_buf[name]
-            gu_drift = (gub.float() - self._snap_gu[name].float()).abs().max().item()
-            dn_drift = (dnb.float() - self._snap_dn[name].float()).abs().max().item()
-            eager_gu = torch.matmul(x, gub.t())
-            eager_z = silu_and_mul(eager_gu)
-            eager_out = torch.matmul(eager_z, dnb.t())
-            diff_gu = (
-                (self._gu_int[name][:t].float() - eager_gu.float()).abs().max().item()
-            )
-            diff_z = (
-                (self._z_int[name][:t].float() - eager_z.float()).abs().max().item()
-            )
-            # out_buf: read late (residual may have freed+reused its memory)
-            diff_out = (
-                (self._out_buf[name][:t].float() - eager_out.float()).abs().max().item()
-            )
-            # out_snap: taken in-graph with no consumer -> the TRUE down-GEMM output
-            diff_snap = (
-                (self._out_snap[name][:t].float() - eager_out.float())
-                .abs()
-                .max()
-                .item()
-            )
-            w_drifted = max(gu_drift, dn_drift) > 1e-3
-            drift += int(w_drifted)
-            d1 += int(diff_gu > 1e-2)
-            d2 += int(diff_z > 1e-2)
-            d3 += int(diff_out > 1e-2)
-            d4 += int(diff_snap > 1e-2)
-            if w_drifted or diff_gu > 1e-2 or diff_out > 1e-2:
-                logger.info(
-                    "  [%s] w_drift(gu=%.3g dn=%.3g) | firstGEMM=%.3g silu=%.3g "
-                    "downGEMM(out_buf late)=%.3g downGEMM(snapshot)=%.3g",
-                    name,
-                    gu_drift,
-                    dn_drift,
-                    diff_gu,
-                    diff_z,
-                    diff_out,
-                    diff_snap,
-                )
-        logger.info(
-            "BWAP divergence probe SUMMARY: %d layers | %d weight-DRIFT | firstGEMM "
-            "div %d | silu div %d | out_buf(late) div %d | out_snap(TRUE) div %d",
-            n,
-            drift,
-            d1,
-            d2,
-            d3,
-            d4,
-        )
-
     def register_graph_buffers(self, registry) -> None:
         """Bind the gathered-weight buffers into SGLang's CUDA-graph buffer registry
-        with a post_fill that copies the frozen real weights in on the replay stream.
-        This is what makes post-capture buffer updates visible to the replayed graph
-        (a bare copy_ is not). Called once from the decode runner before capture."""
+        with a post_fill that copies the CURRENT adaptive mask's gathered weights in
+        on the replay stream (a compute-stream copy may not be visible to replay).
+        This is what delivers the per-cycle mask refresh to the captured graph without
+        recapture. Called once from the decode runner before capture."""
         if self._graph_buffers_registered:
             return
         from sglang.srt.model_executor.cuda_graph_buffer_registry import GraphSlot
