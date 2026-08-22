@@ -355,10 +355,12 @@ class TestBWAPFused(CustomTestCase):
         y_ref = F.linear(silu_and_mul(F.linear(x, gu_w)) * mask, dn_w)  # masked dense
         torch.testing.assert_close(y_fused, y_ref, rtol=1e-4, atol=1e-5)
 
-    def test_graph_gating_opens_after_warmup_freeze(self):
-        # Phase 2b: armed gating keeps graph_ready() False until `warmup` decode
-        # forwards have built the mask; then _freeze_and_fill fills the buffers and
-        # opens the gate. Guards the eager-warmup → frozen-graph handoff.
+    def test_adaptive_graph_gating_per_step(self):
+        # Phase 2b (adaptive, no freeze): armed gating makes graph_ready() PER-STEP —
+        # the graph may run only on an all-prune decode step whose mask is gathered,
+        # and stays eager on exploration steps (so the hooks keep refreshing the
+        # mask). Guards against a regression back to a one-time freeze that would use
+        # the graph on exploration steps and never refresh the mask.
         model = TinyModel()
         mgr = BWAPManager(
             base_model=model,
@@ -370,21 +372,24 @@ class TestBWAPFused(CustomTestCase):
             tp_size=1,
         )
         mgr.install_fused_forwards()
-        mgr.begin_capture(
-            max_bs=8
-        )  # allocate fixed dummy + output buffers (as at capture)
+        mgr.begin_capture(max_bs=8)  # allocate fixed buffers (as at capture)
         mgr.end_capture()
         mgr.arm_graph_gating()
         key = next(iter(mgr.gated_mlps))
-        self.assertFalse(mgr.graph_ready())  # gated until warmup
+        self.assertFalse(mgr.graph_ready())  # nothing scored yet
 
-        mgr._update_mem(key, torch.rand(INTERMEDIATE))  # warmup scoring
+        mgr._update_mem(key, torch.rand(INTERMEDIATE))  # a mask exists
         _extend(mgr, req_ids=[0])
-        for step in range(2):  # _warmup_steps == t_init == 2 decode forwards
-            self.assertFalse(mgr.graph_ready())  # still eager mid-warmup
+        readiness = []
+        for step in range(6):  # 2 explore (T_init), then prune/prune/explore cycles
             _decode(mgr, req_ids=[0], seq_lens=[5 + step])
-        self.assertTrue(mgr.graph_ready())  # gate opened
-        self.assertIn(key, mgr._gate_up_buf)  # buffers filled from the real mask
+            readiness.append(mgr.graph_ready())
+        # Exploration steps (0,1 T_init; 4 the T_E of the first cycle) stay eager;
+        # prune steps (2,3,5) may run the graph. Mirrors the single-request schedule.
+        self.assertEqual(readiness, [False, False, True, True, False, True])
+        # On an all-prune step the current mask was gathered into _real (delivered
+        # to the graph by post_fill) at the real top-k support.
+        self.assertIn(key, mgr._real_gate_up)
         self.assertEqual(int(mgr.masks[key].sum().item()), INTERMEDIATE // 2)
 
     def test_capture_branch_returns_fresh_correct_output(self):

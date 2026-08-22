@@ -268,20 +268,23 @@ class BWAPManager:
         # is ignored (dummy mask) — this measures the end-to-end speedup ceiling.
         self._capture_force = False
 
-        # Phase-2b (correct): frozen-mask-after-warmup. can_run_graph() gates the
-        # captured pruned graph on _graph_ready; while False the runner stays eager
-        # so exploration hooks build the real mask. After `_warmup_steps` decode
-        # forwards, _freeze_and_fill() fills the (fixed-address) buffers from the
-        # real mask and opens the gate. Default True = ungated (probe / non-2b).
+        # Phase-2b ADAPTIVE graph gating (no freeze). can_run_graph() -> graph_ready():
+        #   - ungated (probe / non-2b): _graph_ready stays True (baked mask, run always).
+        #   - gated real 2b: the captured pruned graph runs ONLY on all-prune steps,
+        #     reading the CURRENT adaptive mask's weights (re-gathered into _real each
+        #     time the mask changes; the graph faithfully re-reads its buffers via the
+        #     registry post_fill). Explore/mixed steps stay eager so the act_fn hooks
+        #     refresh the mask. This keeps BWAP adaptive (needed for accuracy) while
+        #     graph-accelerating the ~T_p/T_trans of steps that prune.
         self._graph_ready = True
         self._graph_gated = False  # armed only for real 2b (graph + fused, non-probe)
-        self._decode_forwards = 0
-        self._warmup_steps = t_init
-        # Real (post-warmup) gathered weights, source for the registry post_fill
-        # that copies them into the graph-resident buffers on the replay stream —
-        # a bare copy_ in init_new isn't visible to the captured graph.
+        self._graph_step_allowed = False  # set per decode step when gated
+        # Current adaptive gathered weights, source for the registry post_fill that
+        # copies them into the graph-resident buffers on the replay stream. Re-gathered
+        # whenever the mask version changes (tracked by _real_version).
         self._real_gate_up: Dict[str, torch.Tensor] = {}
         self._real_down: Dict[str, torch.Tensor] = {}
+        self._real_version: Dict[str, int] = {}  # mask_version _real reflects
         self._graph_buffers_registered = False
 
         # Row-step accounting for realized_sparsity (a row-step is one request
@@ -341,15 +344,14 @@ class BWAPManager:
             self._all_prune = self._has_prune and not self._has_collect
             self._total_row_steps += int(steps.numel())
             self._pruned_row_steps += int(self._prune_rows.sum())
-            # Phase-2b: after the eager warmup builds the real mask, freeze it into
-            # the graph-resident buffers and open the graph gate.
-            if self._graph_gated and not self._graph_ready:
-                self._decode_forwards += 1
-                if (
-                    self._decode_forwards >= self._warmup_steps
-                    and self._all_layers_have_scores()
-                ):
-                    self._freeze_and_fill()
+            # Phase-2b adaptive graph gating (no freeze): the captured pruned graph
+            # runs ONLY on all-prune steps, reading the CURRENT adaptive mask (which
+            # the eager explore steps keep refreshing). Refresh _real in place when
+            # the mask changed; the post_fill delivers it to the graph on replay.
+            if self._graph_gated:
+                self._graph_step_allowed = (
+                    self._all_prune and self._refresh_graph_masks()
+                )
         else:
             self._phase = _Phase.IDLE
             self._all_prune = False
@@ -655,64 +657,50 @@ class BWAPManager:
 
     # ---- Phase 2b (correct): frozen-mask-after-warmup graph gating ----------
     def arm_graph_gating(self) -> None:
-        """Gate the captured pruned graph until warmup builds the real mask.
+        """Enable adaptive graph gating for real 2b (fused + decode graph, not probe).
 
-        Called at setup for real 2b (fused + decode graph, not the probe). Until
-        `_freeze_and_fill` runs, `can_run_graph` sees `graph_ready()==False` and
-        keeps decode eager so the act_fn hooks collect scores.
+        Once armed, `graph_ready()` becomes per-step: the captured pruned graph runs
+        only on all-prune steps whose mask is gathered into `_real`; explore/mixed
+        steps stay eager so the act_fn hooks keep refreshing the mask. No freeze.
         """
         self._graph_gated = True
         self._graph_ready = False
 
     def graph_ready(self) -> bool:
-        return self._graph_ready
+        # Ungated (probe / non-2b): baked mask, always ready. Gated real 2b: only on
+        # all-prune steps with the current mask gathered (set by prepare_bwap_batch).
+        if not self._graph_gated:
+            return self._graph_ready
+        return self._graph_step_allowed
 
-    def _all_layers_have_scores(self) -> bool:
-        return all(
-            self.mem_scores.get(name) is not None
-            for name in self.gated_mlps
-            if self._fast_ok.get(name, False)
-        )
-
-    def _freeze_and_fill(self) -> None:
-        """Freeze the warmed-up mask: stash the real gathered weights as the source
-        the registry post_fill copies into the graph buffers each replay, fill them
-        now for the eager/first-replay path, and open the gate.
-
-        The captured graph reads _gate_up_buf/_down_buf (post_fill refreshes them on
-        the replay stream each replay — visible, cf. the pooled-capture probe) and
-        writes into the persistent _out_buf (stable across replay). Both are what
-        make the pruned FFN correct under the captured decode graph; no recapture."""
+    def _refresh_graph_masks(self) -> bool:
+        """Re-gather the CURRENT adaptive mask into `_real` (and seed the graph
+        buffers) for every eligible layer whose mask changed since the last gather.
+        The registry post_fill copies `_real` into the graph buffers on the replay
+        stream, so the captured graph runs the up-to-date mask without recapture.
+        Returns True once every eligible layer has a gathered mask (graph may run)."""
+        ready = True
         for name, mlp in self.gated_mlps.items():
             if not self._fast_ok.get(name, False):
                 continue
+            if self.mem_scores.get(name) is None:
+                ready = False  # no scores yet -> keep this step eager
+                continue
             weight = mlp.down_proj.weight
             self._materialize_mask(name, weight.shape[1], weight.device)
-            keep_idx = self.masks[name].bool().nonzero(as_tuple=False).squeeze(-1)
-            gate_up_k, down_k = gather_ffn_weights(
-                mlp.gate_up_proj.weight, weight, keep_idx, weight.shape[1]
-            )
-            self._real_gate_up[name] = gate_up_k.contiguous()
-            self._real_down[name] = down_k.contiguous()
-            # Also fill the graph buffers now so the eager path (graphs disabled)
-            # and the first post-freeze replay are correct even before a post_fill.
-            if name in self._gate_up_buf:
-                self._gate_up_buf[name].copy_(self._real_gate_up[name])
-                self._down_buf[name].copy_(self._real_down[name])
-        # Validation hook: persist the frozen adaptive masks so a subsequent graph
-        # run can bake them at capture (BWAP_LOAD_MASK) — the machinery + real-mask
-        # end-to-end test that the non-working runtime refresh otherwise blocks.
-        dump_path = os.environ.get("BWAP_DUMP_MASK")
-        if dump_path:
-            torch.save({n: m.detach().cpu() for n, m in self.masks.items()}, dump_path)
-            logger.info(
-                "BWAP: dumped %d frozen masks to %s", len(self.masks), dump_path
-            )
-        self._graph_ready = True  # open the gate: captured pruned graph is now valid
-        logger.info(
-            "BWAP: warmup complete (%d decode forwards) — froze mask, opened graph gate.",
-            self._decode_forwards,
-        )
+            if self._real_version.get(name) != self.mask_version.get(name):
+                keep_idx = self.masks[name].bool().nonzero(as_tuple=False).squeeze(-1)
+                gate_up_k, down_k = gather_ffn_weights(
+                    mlp.gate_up_proj.weight, weight, keep_idx, weight.shape[1]
+                )
+                self._real_gate_up[name] = gate_up_k.contiguous()
+                self._real_down[name] = down_k.contiguous()
+                # Seed the graph buffers directly too (first replay, before post_fill).
+                if name in self._gate_up_buf:
+                    self._gate_up_buf[name].copy_(self._real_gate_up[name])
+                    self._down_buf[name].copy_(self._real_down[name])
+                self._real_version[name] = self.mask_version.get(name, 0)
+        return ready
 
     def log_ge_compare(
         self, graph_logits: torch.Tensor, eager_logits: torch.Tensor, t: int = 1
