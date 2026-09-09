@@ -199,6 +199,15 @@ def create_flex_attention_backend(runner):
     return TorchFlexAttnBackend(runner)
 
 
+@register_attention_backend("flashprefill_sparse")
+def create_flashprefill_sparse_backend(runner):
+    from sglang.srt.layers.attention.block_sparse_prefill import (
+        BlockSparsePrefillAttnBackend,
+    )
+
+    return BlockSparsePrefillAttnBackend(runner)
+
+
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend

@@ -183,6 +183,7 @@ ATTENTION_BACKEND_CHOICES = [
     "triton",
     "torch_native",
     "flex_attention",
+    "flashprefill_sparse",  # mean-corrected block-sparse prefill (arXiv:2608.19758)
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
     "dsv4",
