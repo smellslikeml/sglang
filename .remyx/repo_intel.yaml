@@ -1,0 +1,18 @@
+schema_version: 1
+fork: smellslikeml/sglang
+observed_landing_zones:
+- path: python/sglang/srt/layers/attention/
+  shape_tags:
+  - registry-add
+  confirmed_by:
+  - arxiv: 2608.19758v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: 'ModelRunner attention setup: `_build_full_attention_backend_from_str`
+      calls `ATTENTION_BACKENDS[backend_str](model_runner)` where `backend_str` is
+      `server_args.attention_backend` set by the `--attenti'
+    branch: flashprefill-v2-block-sparse-prefill-attention-for-long-cont
+    timestamp: '2026-09-09T06:28:06Z'
+  last_observed: '2026-09-09T06:28:06Z'
+rejected_shapes: []
+coordination_signals: []
+last_updated: '2026-09-09T06:28:06Z'
