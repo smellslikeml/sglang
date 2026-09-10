@@ -13,6 +13,18 @@ observed_landing_zones:
     branch: flashprefill-v2-block-sparse-prefill-attention-for-long-cont
     timestamp: '2026-09-09T06:28:06Z'
   last_observed: '2026-09-09T06:28:06Z'
+- path: python/sglang/srt/layers/quantization/
+  shape_tags:
+  - unclassified
+  confirmed_by:
+  - arxiv: 2609.04098v1
+    mode: Mode 1 (direct port)
+    call_site_specifics: ModelOptFp4LinearMethod.process_weights_after_loading, invoked
+      by python/sglang/srt/model_loader/loader.py (quant_method.process_weights_after_loading)
+      during weight loading
+    branch: why-gated-deltanet-survives-4-bit-quantization-nvfp4-w4a4-fo
+    timestamp: '2026-09-10T06:20:59Z'
+  last_observed: '2026-09-10T06:20:59Z'
 rejected_shapes: []
 coordination_signals: []
-last_updated: '2026-09-09T06:28:06Z'
+last_updated: '2026-09-10T06:20:59Z'
