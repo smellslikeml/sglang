@@ -53,6 +53,10 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.nvfp4_fused_scale import (
+    needs_fused_nvfp4_reconcile,
+    reconcile_fused_nvfp4_block_scales,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -1758,7 +1762,27 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         layer.register_parameter("weight_scale", weight_scale)
 
+    def _reconcile_fused_global_scale(self, layer: torch.nn.Module) -> None:
+        """Repair the fused-GEMM global-scale mismatch in place.
+
+        No-op unless this layer packs modules that were NVFP4-calibrated with
+        different ``weight_scale_2`` (e.g. a fused QKV or Qwen3 GDN
+        ``in_proj_qkvz`` projection). In that case the native kernel serves the
+        fused weight with a single common global scale, so fold each module's
+        global scale into its FP8 block scales first — otherwise every module
+        but the ``argmax`` one is dequantized with a too-large global scale.
+        """
+        if not needs_fused_nvfp4_reconcile(layer.weight_scale_2):
+            return
+        reconciled = reconcile_fused_nvfp4_block_scales(
+            weight_scale=layer.weight_scale.data,
+            weight_scale_2=layer.weight_scale_2.data,
+            logical_widths=layer.logical_widths,
+        )
+        layer.weight_scale.data.copy_(reconciled)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self._reconcile_fused_global_scale(layer)
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
