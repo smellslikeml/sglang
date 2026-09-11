@@ -24,7 +24,14 @@ observed_landing_zones:
       during weight loading
     branch: why-gated-deltanet-survives-4-bit-quantization-nvfp4-w4a4-fo
     timestamp: '2026-09-10T06:20:59Z'
-  last_observed: '2026-09-10T06:20:59Z'
+  - arxiv: 2609.02652v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: "python/sglang/srt/layers/quantization/__init__.py `BASE_QUANTIZATION_METHODS`\
+      \ \u2192 `get_quantization_config`, invoked by `_get_quantization_config` in\
+      \ `python/sglang/srt/model_loader/loader.py` when a ch"
+    branch: unfolding-the-leech-lattice-fused-multi-shell-decoding-and-v
+    timestamp: '2026-09-11T06:45:53Z'
+  last_observed: '2026-09-11T06:45:53Z'
 rejected_shapes: []
 coordination_signals: []
-last_updated: '2026-09-10T06:20:59Z'
+last_updated: '2026-09-11T06:45:53Z'
