@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQMarlinConfig,
 )
 from sglang.srt.layers.quantization.humming import HummingConfig
+from sglang.srt.layers.quantization.kashin_dct import KashinDCTConfig
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -98,6 +99,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
     "humming": HummingConfig,
     "mxfp_w4a8": Mxfp4W4A8Config,
+    "kashin_dct": KashinDCTConfig,
 }
 
 
@@ -138,6 +140,7 @@ CPU_QUANTIZATION_METHODS = {
     "gptq": CPUGPTQConfig,
     "mxfp4": Mxfp4Config,
     "auto-round": AutoRoundConfig,
+    "kashin_dct": KashinDCTConfig,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}
