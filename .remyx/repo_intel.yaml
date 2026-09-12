@@ -15,7 +15,7 @@ observed_landing_zones:
   last_observed: '2026-09-09T06:28:06Z'
 - path: python/sglang/srt/layers/quantization/
   shape_tags:
-  - unclassified
+  - registry-add
   confirmed_by:
   - arxiv: 2609.04098v1
     mode: Mode 1 (direct port)
@@ -31,7 +31,14 @@ observed_landing_zones:
       \ `python/sglang/srt/model_loader/loader.py` when a ch"
     branch: unfolding-the-leech-lattice-fused-multi-shell-decoding-and-v
     timestamp: '2026-09-11T06:45:53Z'
-  last_observed: '2026-09-11T06:45:53Z'
+  - arxiv: 2609.11687v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: sglang.srt.layers.quantization.get_quantization_config (registry
+      lookup driven by the --quantization CLI flag / HF quant config during model
+      loading), via the BASE_QUANTIZATION_METHODS and CPU_QUANTIZ
+    branch: structured-transforms-for-low-overhead-quantization-of-langu
+    timestamp: '2026-09-12T06:25:49Z'
+  last_observed: '2026-09-12T06:25:49Z'
 rejected_shapes: []
 coordination_signals: []
-last_updated: '2026-09-11T06:45:53Z'
+last_updated: '2026-09-12T06:25:49Z'
