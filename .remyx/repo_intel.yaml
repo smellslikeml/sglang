@@ -39,6 +39,18 @@ observed_landing_zones:
     branch: structured-transforms-for-low-overhead-quantization-of-langu
     timestamp: '2026-09-12T06:25:49Z'
   last_observed: '2026-09-12T06:25:49Z'
+- path: python/sglang/srt/speculative/
+  shape_tags:
+  - unclassified
+  confirmed_by:
+  - arxiv: 2409.10644v3
+    mode: Mode 2 (adapted port)
+    call_site_specifics: AdaptiveStepSlot.update()/_recompute_params(), reached in
+      production from AdaptiveSpeculativeParams.on_verify_complete -> adaptive_runtime_state.py
+      -> eagle_worker_v2.on_verify_complete_cpu -> batch_r
+    branch: improving-multi-candidate-speculative-decoding
+    timestamp: '2026-09-13T06:26:47Z'
+  last_observed: '2026-09-13T06:26:47Z'
 rejected_shapes: []
 coordination_signals: []
-last_updated: '2026-09-12T06:25:49Z'
+last_updated: '2026-09-13T06:26:47Z'
