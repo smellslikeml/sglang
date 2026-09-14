@@ -15,8 +15,14 @@ that raw distribution out of SGLang's CUDA-graph draft loop is invasive and
 device-synchronous. Instead we reconstruct an equivalent per-position
 confidence from the empirical acceptance profile already produced at verify
 time: the fraction of requests whose draft was still accepted at each position.
-Smoothed with an EMA, this profile is exactly the marginal per-position
-acceptance probability DynaSD's rule consumes.
+
+That empirical profile is an *unconditional* survival curve — position ``pos``
+holds ``P(accept_length > pos)`` — whereas DynaSD's running product consumes the
+*conditional* acceptance ``p_pos = P(accept pos | accepted 0..pos-1)``. We
+convert survival to conditional (``conditional_accept_profile``) before applying
+the rule, so the running product telescopes back to the true joint survival of
+the whole chain rather than a product of survivals that over-truncates long
+drafts. Smoothed with an EMA, this is the marginal signal DynaSD's rule expects.
 
 The resulting confidence-implied length is used by ``AdaptiveStepSlot`` as an
 upward ceiling on ``speculative_num_steps`` — a draft-length signal that
@@ -31,11 +37,13 @@ from typing import List, Sequence
 def accept_profile(
     num_correct_drafts_per_req: Sequence[int], num_positions: int
 ) -> List[float]:
-    """Empirical per-position marginal acceptance probability.
+    """Empirical per-position *unconditional* acceptance probability.
 
     ``accept_profile(...)[pos]`` is the fraction of requests whose verified
-    draft reached at least position ``pos + 1`` — i.e. the probability that the
-    draft token at position ``pos`` was accepted, given the whole batch.
+    draft reached at least position ``pos + 1`` — i.e. the survival probability
+    ``P(accept_length > pos)`` across the batch. The curve is monotonically
+    non-increasing; ``conditional_accept_profile`` turns it into the per-step
+    conditional acceptance the running-product rule consumes.
 
     Args:
         num_correct_drafts_per_req: Per-request accepted draft counts (drafts
@@ -52,6 +60,27 @@ def accept_profile(
         sum(1 for c in num_correct_drafts_per_req if c > pos) / n
         for pos in range(num_positions)
     ]
+
+
+def conditional_accept_profile(profile: Sequence[float]) -> List[float]:
+    """Per-step *conditional* acceptance derived from an unconditional profile.
+
+    ``accept_profile`` reports the unconditional survival ``S_pos`` that a draft
+    reaches each position. DynaSD's running-product rule instead needs the
+    conditional acceptance ``p_pos = P(accept pos | accepted 0..pos-1) =
+    S_pos / S_{pos-1}`` (with ``S_{-1} = 1``). Multiplying these conditionals
+    telescopes back to the joint survival ``S_{L-1}`` of a length-``L`` chain, so
+    ``confidence_implied_length`` measures the true probability the whole chain
+    clears verification instead of a product of survivals that under-counts it.
+    A zero survival makes every later conditional zero (the chain is already
+    dead), which the rule reads as an immediate stop.
+    """
+    conditional: List[float] = []
+    prev = 1.0
+    for p in profile:
+        conditional.append(p / prev if prev > 0.0 else 0.0)
+        prev = p
+    return conditional
 
 
 def confidence_implied_length(profile: Sequence[float], *, threshold: float) -> int:
@@ -99,5 +128,11 @@ class DraftConfidenceTracker:
         ]
 
     def implied_length(self, threshold: float) -> int:
-        """Confidence-implied draft length under the current EMA profile."""
-        return confidence_implied_length(self.profile, threshold=threshold)
+        """Confidence-implied draft length under the current EMA profile.
+
+        The EMA tracks an unconditional survival curve; it is converted to
+        per-step conditional acceptance so the running product recovers the true
+        joint chain survival (see ``conditional_accept_profile``).
+        """
+        conditional = conditional_accept_profile(self.profile)
+        return confidence_implied_length(conditional, threshold=threshold)
