@@ -12,6 +12,7 @@ import math
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dynamic_draft_length import DraftConfidenceTracker
 from sglang.srt.utils import log_info_on_rank0
 
@@ -166,7 +167,13 @@ class AdaptiveStepSlot:
         # DynaSD (arXiv:2409.10644) confidence ceiling. When enabled, drafts are
         # only extended while the cumulative per-position acceptance confidence
         # stays above this threshold; see dynamic_draft_length. Disabled at 0.
-        self.confidence_threshold = cfg.get("confidence_threshold", 0.0)
+        # Gated default-off behind SGLANG_ENABLE_DYNASD_CONFIDENCE_CEILING so the
+        # config's confidence_threshold is only honored when explicitly opted in.
+        self.confidence_threshold = (
+            cfg.get("confidence_threshold", 0.0)
+            if envs.SGLANG_ENABLE_DYNASD_CONFIDENCE_CEILING.get()
+            else 0.0
+        )
         self._confidence = (
             DraftConfidenceTracker(
                 num_positions=max(self.candidate_steps),
