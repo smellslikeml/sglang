@@ -2,9 +2,10 @@ import functools
 import json
 import os
 import warnings
+from collections.abc import Callable
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
 
 @functools.lru_cache(maxsize=1)
@@ -1139,6 +1140,10 @@ class Envs:
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # Opt-in gate for the DynaSD (arXiv:2409.10644) draft-confidence ceiling in
+    # adaptive spec: when off, the adaptive config's ``confidence_threshold`` is
+    # ignored and the draft-length path is byte-for-byte unchanged.
+    SGLANG_ENABLE_DYNASD_CONFIDENCE_CEILING = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
@@ -1524,9 +1529,9 @@ class _DeprecatedEnv:
 
     def __init__(
         self,
-        replacement: Optional[str] = None,
-        transform: Optional[Callable[[str], str]] = None,
-        note: Optional[str] = None,
+        replacement: str | None = None,
+        transform: Callable[[str], str] | None = None,
+        note: str | None = None,
     ):
         self.replacement = replacement
         self.transform = transform
@@ -1560,7 +1565,7 @@ def _invert_bool(value: str) -> str:
 # import by _handle_deprecated_envs(). Add new deprecations here instead of
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+_DEPRECATED_ENVS: dict[str, _DeprecatedEnv] = {
     # Renamed: the value is forwarded to the replacement.
     "SGLANG_GC_LOG": _DeprecatedEnv(replacement="SGLANG_LOG_GC"),
     "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH": _DeprecatedEnv(
@@ -1636,7 +1641,7 @@ def _handle_deprecated_envs():
             os.environ[new_key] = value
 
 
-def third_party_cache_defaults() -> Dict[str, str]:
+def third_party_cache_defaults() -> dict[str, str]:
     base = os.path.expanduser(envs.SGLANG_CACHE_DIR.get())
     return {
         "TRITON_CACHE_DIR": os.path.join(base, "triton"),
@@ -1670,4 +1675,4 @@ _handle_deprecated_envs()
 # launching Python. Imported conditionally to keep the default import of this
 # module free of non-stdlib side effects.
 if envs.SGLANG_CUDA_COREDUMP.get():
-    import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402  # isort: skip
+    import sglang.srt.debug_utils.cuda_coredump  # noqa: F401  # isort: skip
