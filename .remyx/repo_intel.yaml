@@ -50,7 +50,13 @@ observed_landing_zones:
       -> eagle_worker_v2.on_verify_complete_cpu -> batch_r
     branch: improving-multi-candidate-speculative-decoding
     timestamp: '2026-09-13T06:26:47Z'
-  last_observed: '2026-09-13T06:26:47Z'
+  - arxiv: 2402.13720v3
+    mode: Mode 3 (inspired experiment)
+    call_site_specifics: NGRAMWorker._update_ngram_corpus (python/sglang/srt/speculative/ngram_worker.py:432),
+      invoked from forward_batch_generation (line 550), gated on server_args.speculative_ngram_recycle_draft_phrases
+    branch: ouroboros-generating-longer-drafts-phrase-by-phrase-for-fast
+    timestamp: '2026-09-15T06:22:44Z'
+  last_observed: '2026-09-15T06:22:44Z'
 rejected_shapes: []
 coordination_signals: []
-last_updated: '2026-09-13T06:26:47Z'
+last_updated: '2026-09-15T06:22:44Z'
