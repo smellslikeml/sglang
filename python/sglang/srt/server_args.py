@@ -2336,6 +2336,11 @@ class ServerArgs:
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
         NS("spec"),
     ] = 10000000
+    speculative_ngram_recycle_draft_phrases: A[
+        bool,
+        "Recycle the verify-tree draft branches (including non-taken siblings) back into the ngram candidate pool so future contexts can retrieve longer phrase drafts. Adapted from Ouroboros (arXiv:2402.13720). Trades a larger pool for potential draft-hit-rate dilution; correctness is unaffected since all drafts are still target-verified.",
+        NS("spec"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Expert parallelism

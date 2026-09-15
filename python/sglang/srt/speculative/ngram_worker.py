@@ -21,6 +21,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWo
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
+from sglang.srt.speculative.phrase_recycler import build_recycled_phrases
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
@@ -107,6 +108,11 @@ class NGRAMWorker(BaseSpecWorker):
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
         self.grammar_tree_host: Optional[tuple] = None
+        # Ouroboros-style draft-phrase recycling (opt-in): stages the host-side
+        # (draft_tokens, tree_mask) of the current verify step so
+        # _update_ngram_corpus can feed the proposed branches back into the pool.
+        self.recycle_draft_phrases = server_args.speculative_ngram_recycle_draft_phrases
+        self._recycle_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
@@ -340,6 +346,12 @@ class NGRAMWorker(BaseSpecWorker):
 
         # Staged for the grammar bitmask, derived after the verify launch below.
         self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
+        # Staged for draft-phrase recycling, consumed after verify in
+        # _update_ngram_corpus. Kept before the in-place mask reshape below so the
+        # recycler sees the flat (bs * draft_token_num^2) layout it expects.
+        self._recycle_tree_host = (
+            (req_drafts, mask) if self.recycle_draft_phrases else None
+        )
 
         # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask(
@@ -420,7 +432,31 @@ class NGRAMWorker(BaseSpecWorker):
             )
             batch_tokens.append(put_ids)
             i += 1
+        if self.recycle_draft_phrases and self._recycle_tree_host is not None:
+            batch_tokens = batch_tokens + self._recycled_draft_phrases(batch_tokens)
         self.ngram_corpus.batch_put(batch_tokens)
+
+    def _recycled_draft_phrases(self, context_tails: list) -> list:
+        """Turn the staged verify-tree branches into anchored candidate phrases.
+
+        Leaf paths are extracted with the corpus' own tree walker so the phrase
+        boundaries match how the pool stored them; the Ouroboros recycling policy
+        (anchoring, length filter, per-request cap) lives in
+        ``build_recycled_phrases``.
+        """
+        req_drafts, mask = self._recycle_tree_host
+        bs = len(context_tails)
+        stride = self.draft_token_num
+        drafts = req_drafts.reshape(bs, stride).tolist()
+        masks = mask.reshape(bs, stride, stride).tolist()
+        leaf_paths = [
+            self.ngram_corpus.leaf_paths_from_mask(drafts[b], masks[b])
+            for b in range(bs)
+        ]
+        return build_recycled_phrases(
+            leaf_paths=leaf_paths,
+            context_tails=context_tails,
+        )
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None
