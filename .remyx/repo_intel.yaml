@@ -57,6 +57,17 @@ observed_landing_zones:
     branch: ouroboros-generating-longer-drafts-phrase-by-phrase-for-fast
     timestamp: '2026-09-15T06:22:44Z'
   last_observed: '2026-09-15T06:22:44Z'
+- path: python/sglang/srt/layers/moe/
+  shape_tags:
+  - unclassified
+  confirmed_by:
+  - arxiv: 2609.05228v1
+    mode: Mode 3 (inspired experiment)
+    call_site_specifics: "python/sglang/srt/layers/moe/topk.py \u2014 select_experts(),\
+      \ immediately after the top-k selection / recorder step, via maybe_apply_adaptive_expert_skip(...)"
+    branch: ace-adaptive-calibration-free-expert-skipping-for-moe-based-
+    timestamp: '2026-09-16T06:28:49Z'
+  last_observed: '2026-09-16T06:28:49Z'
 rejected_shapes: []
 coordination_signals: []
-last_updated: '2026-09-15T06:22:44Z'
+last_updated: '2026-09-16T06:28:49Z'
