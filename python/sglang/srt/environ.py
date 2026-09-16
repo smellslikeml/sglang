@@ -1031,6 +1031,14 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # Token-adaptive expert skipping (ACE, arXiv:2609.05228): drop a routed
+    # expert slot only when both the gate-share and router-direction views mark
+    # it low-contribution, always keeping the top-1 expert. Off by default;
+    # only engages on the standard routed path (no EPLB remap, no fused shared
+    # experts). THRESHOLD is the fraction of the top-1 signal below which a slot
+    # is a skip candidate on each view.
+    SGLANG_ENABLE_MOE_ADAPTIVE_EXPERT_SKIP = EnvBool(False)
+    SGLANG_MOE_EXPERT_SKIP_THRESHOLD = EnvFloat(0.1)
 
     # ===================================================================
     # DeepGEMM Mega MoE
