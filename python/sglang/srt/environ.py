@@ -1139,6 +1139,12 @@ class Envs:
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # Opt-in: after each NGRAM verify step, fold the target model's
+    # high-confidence final-layer bonus-logit tokens back into the n-gram corpus
+    # as short context->token seeds, so the next draft round can propose the
+    # model's confident continuations (ECHO, arXiv:2609.17241). Off by default
+    # since it adds a small per-step top-k readback.
+    SGLANG_ENABLE_NGRAM_BONUS_LOGIT_SEED = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

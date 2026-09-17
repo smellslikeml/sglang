@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -18,6 +19,11 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
+from sglang.srt.speculative.bonus_logit_candidates import (
+    DEFAULT_BONUS_LOGIT_PROB_THRESHOLD,
+    DEFAULT_BONUS_LOGIT_TOP_K,
+    bonus_logit_corpus_seeds,
+)
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -103,6 +109,13 @@ class NGRAMWorker(BaseSpecWorker):
         self.device = server_args.device
 
         self.adaptive_controller = None
+        # ECHO-style outer loop: seed the corpus with the target's confident
+        # final-layer bonus-logit tokens after each verify (opt-in).
+        self.enable_bonus_logit_seed: bool = (
+            envs.SGLANG_ENABLE_NGRAM_BONUS_LOGIT_SEED.get()
+        )
+        self.bonus_logit_top_k: int = DEFAULT_BONUS_LOGIT_TOP_K
+        self.bonus_logit_prob_threshold: float = DEFAULT_BONUS_LOGIT_PROB_THRESHOLD
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
@@ -422,6 +435,49 @@ class NGRAMWorker(BaseSpecWorker):
             i += 1
         self.ngram_corpus.batch_put(batch_tokens)
 
+    def _seed_corpus_from_bonus_logits(
+        self,
+        batch: ScheduleBatch,
+        logits_output,
+        accept_index: torch.Tensor,
+        accept_lens: torch.Tensor,
+    ) -> None:
+        """ECHO outer loop: supplement the corpus with the target's confident
+        final-layer bonus-logit tokens (see bonus_logit_candidates)."""
+        bs = len(batch.reqs)
+        if bs == 0:
+            return
+
+        # Final-layer logits at each request's last accepted (bonus) position.
+        last_slot = (accept_lens - 1).clamp_(min=0).to(torch.long)
+        bonus_pos = accept_index[
+            torch.arange(bs, device=accept_index.device), last_slot
+        ]
+        bonus_pos = bonus_pos.clamp_(min=0).to(torch.long)
+        bonus_logits = logits_output.next_token_logits[bonus_pos]
+
+        probs = torch.softmax(bonus_logits.float(), dim=-1)
+        top_k = min(self.bonus_logit_top_k, probs.shape[-1])
+        topk_probs, topk_tokens = probs.topk(top_k, dim=-1)
+
+        context_tails = [
+            self._efficient_concat_last_n(
+                list(req.origin_input_ids[-self.max_trie_depth :]),
+                list(req.output_ids[-self.max_trie_depth :]),
+                self.max_trie_depth,
+            )
+            for req in batch.reqs
+        ]
+        seeds = bonus_logit_corpus_seeds(
+            topk_tokens=topk_tokens.tolist(),
+            topk_probs=topk_probs.tolist(),
+            context_tails=context_tails,
+            prob_threshold=self.bonus_logit_prob_threshold,
+            max_trie_depth=self.max_trie_depth,
+        )
+        if seeds:
+            self.ngram_corpus.batch_put(seeds)
+
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None
     ) -> GenerationBatchResult:
@@ -512,6 +568,10 @@ class NGRAMWorker(BaseSpecWorker):
                 on_publish(new_seq_lens)
 
             self._update_ngram_corpus(batch)
+            if self.enable_bonus_logit_seed:
+                self._seed_corpus_from_bonus_logits(
+                    batch, logits_output, accept_index, accept_lens
+                )
             # Erase match state of requests that left the decode batch.
             # req.finished() is unusable here: under overlap it flips at result
             # processing, one iteration after the request left the batch.
