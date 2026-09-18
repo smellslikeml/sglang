@@ -75,6 +75,12 @@ observed_landing_zones:
     branch: ace-adaptive-calibration-free-expert-skipping-for-moe-based-
     timestamp: '2026-09-16T06:28:49Z'
   last_observed: '2026-09-16T06:28:49Z'
-rejected_shapes: []
+rejected_shapes:
+- shape_tag: null
+  reason_code: null
+  reason_summary: ''
+  observed:
+  - arxiv: 2402.10076v1
+    timestamp: '2026-09-18T06:16:35Z'
 coordination_signals: []
-last_updated: '2026-09-17T06:24:01Z'
+last_updated: '2026-09-18T06:16:35Z'
