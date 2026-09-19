@@ -471,6 +471,16 @@ class Envs:
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
     # ===================================================================
+    # MoE: token-adaptive expert skipping (ACE, arXiv:2609.05228)
+    # ===================================================================
+    # Opt-in, calibration-free skipping of low-contribution routed experts.
+    # A slot is dropped only when every enabled view (gate floor + gate
+    # relative to the per-token top-1) agrees; the top-1 expert is always kept.
+    SGLANG_ENABLE_ADAPTIVE_EXPERT_SKIP = EnvBool(False)
+    SGLANG_ADAPTIVE_EXPERT_SKIP_GATE_FLOOR = EnvFloat(0.0)
+    SGLANG_ADAPTIVE_EXPERT_SKIP_REL_RATIO = EnvFloat(0.0)
+
+    # ===================================================================
     # DSpark speculative decoding
     # ===================================================================
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)

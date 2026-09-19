@@ -94,6 +94,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.adaptive_expert_skip import maybe_apply_adaptive_expert_skip
 from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
 )
@@ -2323,6 +2324,17 @@ def select_experts(
     get_global_expert_distribution_recorder().on_select_experts(
         topk_ids=recorder_topk_ids
     )
+
+    # ACE (arXiv:2609.05228): drop low-contribution routed experts per token,
+    # keeping the top-1. No-op unless SGLANG_ENABLE_ADAPTIVE_EXPERT_SKIP is set.
+    # Skipped on the experimental packed path, whose packed_topk_ids would also
+    # need updating.
+    if packed_topk is None:
+        topk_ids, topk_weights = maybe_apply_adaptive_expert_skip(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            num_fused_shared_experts=num_fused_shared_experts,
+        )
 
     # ===== TO BE REFACTORED ====
     if packed_topk is not None:
