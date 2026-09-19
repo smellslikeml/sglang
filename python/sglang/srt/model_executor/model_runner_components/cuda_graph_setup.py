@@ -174,6 +174,21 @@ def capture_cuda_graphs(
         memory_usage_gb=0,
         capture_time=0,
     )
+    # BWAP Phase 2b: when fused + decode graph are both on, install the wrapper and
+    # force the gather path BEFORE decode capture (prefill above stays dense), so the
+    # captured decode graph is the k-width pruned FFN. Probe fills dummy buffers and
+    # runs the graph from step 0 (perf-only). Real 2b arms graph-gating after capture
+    # so decode stays eager until the warmup builds the real mask (then freezes it in).
+    bwap_graph = (
+        model_runner.bwap_manager is not None
+        and model_runner.server_args.bwap_fused
+        and capture_decode_cuda_graph
+    )
+    if bwap_graph:
+        model_runner.bwap_manager.install_fused_forwards()
+        bwap_capture_bs, _ = get_batch_sizes_to_capture(model_runner, 1)
+        model_runner.bwap_manager.begin_capture(max_bs=max(bwap_capture_bs))
+
     if capture_decode_cuda_graph:
         if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
             decode = capture_decode_graph(model_runner=model_runner)
@@ -189,6 +204,11 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
+    if bwap_graph:
+        model_runner.bwap_manager.end_capture()
+        if not model_runner.server_args.bwap_probe:
+            model_runner.bwap_manager.arm_graph_gating()
+
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
     # fire only on the eager forward path (capture replay never runs Python
@@ -197,6 +217,13 @@ def capture_cuda_graphs(
         register_forward_hooks(
             model_runner.model, model_runner.server_args.forward_hooks
         )
+    # BWAP: act_fn hooks are always eager-path only (scoring during warmup / when
+    # graphs are off). The fused wrapper is installed pre-capture for the graph
+    # path (bwap_graph); install it here only for the eager-only fused path.
+    if model_runner.bwap_manager is not None:
+        model_runner.bwap_manager.register_hooks()
+        if model_runner.server_args.bwap_fused and not bwap_graph:
+            model_runner.bwap_manager.install_fused_forwards()
 
     prealloc_symmetric_memory_pool(
         is_draft_worker=model_runner.is_draft_worker,

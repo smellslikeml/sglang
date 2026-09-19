@@ -928,6 +928,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        # Init BWAP (batch-wise adaptive pruning) step state for the act_fn
+        # hooks. bwap_manager is None when disabled or on draft workers.
+        if (
+            model_runner.server_args.enable_bwap
+            and model_runner.bwap_manager is not None
+        ):
+            model_runner.bwap_manager.prepare_bwap_batch(
+                forward_mode=ret.forward_mode,
+                req_pool_indices=ret.req_pool_indices,
+                seq_lens=ret.seq_lens,
+            )
+
         if (
             model_runner.ps.attn_dcp_size > 1
             and ret.out_cache_loc is not None
