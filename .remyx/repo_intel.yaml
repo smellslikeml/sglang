@@ -70,11 +70,12 @@ observed_landing_zones:
   confirmed_by:
   - arxiv: 2609.05228v1
     mode: Mode 3 (inspired experiment)
-    call_site_specifics: "python/sglang/srt/layers/moe/topk.py \u2014 select_experts(),\
-      \ immediately after the top-k selection / recorder step, via maybe_apply_adaptive_expert_skip(...)"
-    branch: ace-adaptive-calibration-free-expert-skipping-for-moe-based-
-    timestamp: '2026-09-16T06:28:49Z'
-  last_observed: '2026-09-16T06:28:49Z'
+    call_site_specifics: "python/sglang/srt/layers/moe/topk.py \u2014 inside select_experts()\
+      \ (the MoE routing entry point invoked by the TopK forward paths), guarded to\
+      \ the non-packed path via maybe_apply_adaptive_expert_skip()."
+    branch: ace-adaptive-calibration-free-expert-skipping-for-moe-based--v2
+    timestamp: '2026-09-19T06:25:07Z'
+  last_observed: '2026-09-19T06:25:07Z'
 rejected_shapes:
 - shape_tag: null
   reason_code: null
@@ -83,4 +84,4 @@ rejected_shapes:
   - arxiv: 2402.10076v1
     timestamp: '2026-09-18T06:16:35Z'
 coordination_signals: []
-last_updated: '2026-09-18T06:16:35Z'
+last_updated: '2026-09-19T06:25:07Z'
