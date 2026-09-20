@@ -76,6 +76,18 @@ observed_landing_zones:
     branch: ace-adaptive-calibration-free-expert-skipping-for-moe-based--v2
     timestamp: '2026-09-19T06:25:07Z'
   last_observed: '2026-09-19T06:25:07Z'
+- path: python/sglang/srt/mem_cache/sparsity/algorithms/
+  shape_tags:
+  - registry-add
+  confirmed_by:
+  - arxiv: 2405.12532v2
+    mode: Mode 2 (adapted port)
+    call_site_specifics: "python/sglang/srt/mem_cache/sparsity/factory.py \u2014 `_ALGORITHM_REGISTRY['pyramid_budget']`,\
+      \ consumed by `_create_sparse_algorithm` inside `create_sparse_coordinator`,\
+      \ which selects the algorithm from `"
+    branch: pyramidinfer-pyramid-kv-cache-compression-for-high-throughpu
+    timestamp: '2026-09-20T06:21:41Z'
+  last_observed: '2026-09-20T06:21:41Z'
 rejected_shapes:
 - shape_tag: null
   reason_code: null
@@ -84,4 +96,4 @@ rejected_shapes:
   - arxiv: 2402.10076v1
     timestamp: '2026-09-18T06:16:35Z'
 coordination_signals: []
-last_updated: '2026-09-19T06:25:07Z'
+last_updated: '2026-09-20T06:21:41Z'
