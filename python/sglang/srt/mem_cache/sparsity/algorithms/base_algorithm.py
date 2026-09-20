@@ -325,7 +325,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             scores[:, recent_start:] = float("-inf")
 
             history_pages = max(recent_start, 1)
-            k = max(int(history_pages * self.sparsity_ratio), 1)
+            k = max(int(history_pages * self._sparsity_ratio_for_layer(layer_id)), 1)
             k = min(k, history_pages)
             topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1].squeeze(0)
 
@@ -353,6 +353,14 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             out_lengths[i] = length
 
         return out_indices, out_lengths
+
+    def _sparsity_ratio_for_layer(self, layer_id: int) -> float:
+        """Fraction of history pages to retain when selecting top-k at this layer.
+
+        Default is a uniform budget across all sparse layers. Algorithms with a
+        layer-dependent budget (e.g. a decreasing pyramid schedule) override this.
+        """
+        return self.sparsity_ratio
 
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int
