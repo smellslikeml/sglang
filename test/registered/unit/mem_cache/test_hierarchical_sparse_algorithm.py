@@ -59,12 +59,14 @@ def _one_hot_key_buffer():
     return buf
 
 
-def _wire_algorithm(algo, seq_len):
-    key_buffer = _one_hot_key_buffer()
+def _wire_algorithm(algo, seq_len, key_buffer=None):
+    if key_buffer is None:
+        key_buffer = _one_hot_key_buffer()
+    num_tokens = key_buffer.shape[0]
     token_to_kv_pool = SimpleNamespace(get_key_buffer=lambda _layer: key_buffer)
     # Identity logical->physical mapping so page indices line up with storage.
-    req_to_token = torch.arange(NUM_TOKENS, dtype=torch.long, device=DEVICE).view(
-        1, NUM_TOKENS
+    req_to_token = torch.arange(num_tokens, dtype=torch.long, device=DEVICE).view(
+        1, num_tokens
     )
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
     states = SimpleNamespace(
@@ -112,9 +114,10 @@ class TestHierarchicalSparseAlgorithm(CustomTestCase):
             0, req_pool_indices, seq_lens, key_buffer, forward_batch
         )
         self.assertTrue(bool(algo.states.repr_constructed[0]))
-        # Page 2's landmark should be the basis-2 direction (masked mean of keys).
+        # With the default single landmark, page 2's landmark should be the
+        # basis-2 direction (masked mean of keys).
         torch.testing.assert_close(
-            algo.page_k_mean[0][2, 0],
+            algo.page_k_landmarks[0][2, 0, 0],
             torch.tensor([0.0, 0.0, 1.0, 0.0], device=DEVICE),
         )
 
@@ -157,6 +160,72 @@ class TestHierarchicalSparseAlgorithm(CustomTestCase):
             query, 0, req_pool_indices, sparse_mask, forward_batch=forward_batch
         )
         self.assertEqual(int(lengths[0]), 0)
+
+    def _select_one_history_page(self, num_landmarks):
+        """Run HSA on a needle scenario, return the chosen history page.
+
+        Page layout (page_size=2, 4 pages, query along basis-0):
+          page 0: orthogonal (basis-3) filler
+          page 1: NEEDLE -> token0 = +basis-0, token1 = -basis-0 (mean cancels)
+          page 2: uniformly weak positive along basis-0 (mean = 0.4)
+          page 3: recent page, always retained
+
+        With a single mean landmark, page 1 averages to 0 and page 2 (mean 0.4)
+        wins the single history slot. With per-token landmarks, page 1's needle
+        token scores highest and wins -- the paper's fine-grained token-to-chunk
+        relevance in action.
+        """
+        seq_len = 8
+        key_buffer = torch.zeros(
+            (seq_len, 1, HEAD_DIM), dtype=torch.float32, device=DEVICE
+        )
+        key_buffer[0, 0, 3] = 1.0  # page 0 filler
+        key_buffer[1, 0, 3] = 1.0
+        key_buffer[2, 0, 0] = 1.0  # page 1 needle token
+        key_buffer[3, 0, 0] = -1.0  # page 1 distractor token
+        key_buffer[4, 0, 0] = 0.4  # page 2 weak-but-uniform
+        key_buffer[5, 0, 0] = 0.4
+        key_buffer[6, 0, 1] = 1.0  # page 3 recent
+        key_buffer[7, 0, 1] = 1.0
+
+        config = _make_config(num_landmarks=num_landmarks, sparsity_ratio=0.3)
+        algo = _create_sparse_algorithm(config, DEVICE)
+        _wire_algorithm(algo, seq_len, key_buffer=key_buffer)
+
+        req_pool_indices = torch.tensor([0], dtype=torch.long, device=DEVICE)
+        seq_lens = torch.tensor([seq_len], dtype=torch.long, device=DEVICE)
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: True,
+                is_decode_or_idle=lambda: False,
+            ),
+            seq_lens=seq_lens,
+        )
+        algo.construct_representations(
+            0, req_pool_indices, seq_lens, key_buffer, forward_batch
+        )
+
+        query = torch.zeros((1, 1, HEAD_DIM), dtype=torch.float32, device=DEVICE)
+        query[0, 0, 0] = 10.0  # points along basis-0
+        sparse_mask = torch.tensor([True], device=DEVICE)
+        selected, _ = algo.retrieve_topk(
+            query, 0, req_pool_indices, sparse_mask, forward_batch=forward_batch
+        )
+        chosen = {int(x) for x in selected[0].tolist() if x >= 0}
+        chosen.discard(3)  # drop the always-retained recent page
+        self.assertEqual(len(chosen), 1)
+        return next(iter(chosen))
+
+    def test_fine_grained_landmarks_select_needle_page(self):
+        """Multi-landmark HSA selects the page holding the needle token.
+
+        A single mean landmark averages the needle away and picks the weak
+        uniform page (2); splitting the page into per-token landmarks lets the
+        needle page (1) win -- guards the fine-grained token-to-chunk relevance
+        integration against a regression back to pure mean pooling.
+        """
+        self.assertEqual(self._select_one_history_page(num_landmarks=1), 2)
+        self.assertEqual(self._select_one_history_page(num_landmarks=2), 1)
 
 
 if __name__ == "__main__":
