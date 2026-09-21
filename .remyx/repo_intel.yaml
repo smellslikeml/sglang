@@ -87,7 +87,14 @@ observed_landing_zones:
       \ which selects the algorithm from `"
     branch: pyramidinfer-pyramid-kv-cache-compression-for-high-throughpu
     timestamp: '2026-09-20T06:21:41Z'
-  last_observed: '2026-09-20T06:21:41Z'
+  - arxiv: 2504.16795v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: Registered in `_ALGORITHM_REGISTRY` in python/sglang/srt/mem_cache/sparsity/factory.py,
+      selected by `_create_sparse_algorithm` inside `create_sparse_coordinator` when
+      config `algorithm == 'hierarchica
+    branch: random-long-context-access-for-mamba-via-hardware-aligned-hi
+    timestamp: '2026-09-21T06:25:12Z'
+  last_observed: '2026-09-21T06:25:12Z'
 rejected_shapes:
 - shape_tag: null
   reason_code: null
@@ -96,4 +103,4 @@ rejected_shapes:
   - arxiv: 2402.10076v1
     timestamp: '2026-09-18T06:16:35Z'
 coordination_signals: []
-last_updated: '2026-09-20T06:21:41Z'
+last_updated: '2026-09-21T06:25:12Z'
