@@ -63,7 +63,14 @@ observed_landing_zones:
       when self.enable_bonus_logit_seed is '
     branch: echo-early-layer-collaborative-hierarchical-orchestration-wi
     timestamp: '2026-09-17T06:24:01Z'
-  last_observed: '2026-09-17T06:24:01Z'
+  - arxiv: 2609.21827v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: "python/sglang/srt/speculative/eagle_worker_v2.py:732 \u2014\
+      \ EagleDraftWorker's draft-forward path calls organize_draft_results(..., proxy_temperatures=...),\
+      \ gated by proxy_scores_enabled() (SGLANG_ENABLE_R"
+    branch: rheosampling-resolving-the-one-hot-dilemma-in-stochastic-dyn
+    timestamp: '2026-09-22T06:24:13Z'
+  last_observed: '2026-09-22T06:24:13Z'
 - path: python/sglang/srt/layers/moe/
   shape_tags:
   - unclassified
@@ -103,4 +110,4 @@ rejected_shapes:
   - arxiv: 2402.10076v1
     timestamp: '2026-09-18T06:16:35Z'
 coordination_signals: []
-last_updated: '2026-09-21T06:25:12Z'
+last_updated: '2026-09-22T06:24:13Z'
