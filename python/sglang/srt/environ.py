@@ -1139,6 +1139,14 @@ class Envs:
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # RheoSampling (arXiv:2609.21827): decouple the draft-tree pruning score from
+    # the verification probability under stochastic decoding (T>0). When on, the
+    # global top-k that prunes the dynamic draft tree runs on a temperature-gated
+    # proxy score instead of the raw product-of-probabilities, so diverse branches
+    # that stochastic verification may accept are not collapsed toward the greedy
+    # chain. Verification is unchanged (still lossless); the greedy T=0 path is a
+    # per-row no-op. Off by default.
+    SGLANG_ENABLE_RHEO_PROXY_SCORES = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

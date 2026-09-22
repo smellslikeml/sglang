@@ -71,6 +71,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
+from sglang.srt.speculative.draft_tree_proxy_scores import proxy_scores_enabled
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
@@ -720,8 +721,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             parent_list = self._topk1_parents_prealloc[:bs]
             return parent_list, top_scores_index, draft_tokens, draft_probs
 
+        # RheoSampling (arXiv:2609.21827): under stochastic decoding, prune the
+        # draft tree on a proxy score decoupled from the verification probability.
+        # Opt-in and a per-row no-op for greedy (T=0) requests.
+        proxy_temperatures = (
+            forward_batch.sampling_info.temperatures
+            if proxy_scores_enabled()
+            else None
+        )
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            score_list,
+            token_list,
+            parents_list,
+            self.speculative_num_draft_tokens,
+            proxy_temperatures=proxy_temperatures,
         )
 
         return parent_list, top_scores_index, draft_tokens, draft_probs

@@ -21,6 +21,10 @@ from sglang.srt.mem_cache.allocation_sizing import (
 )
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.speculative.draft_tree_proxy_scores import (
+    draft_node_depths,
+    temperature_proxy_scores,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -109,12 +113,28 @@ def organize_draft_results(
     token_list: List[torch.Tensor],
     parents_list: List[torch.Tensor],
     num_draft_token: int,
+    proxy_temperatures: Optional[torch.Tensor] = None,
 ):
+    # RheoSampling (arXiv:2609.21827): per-node tree depth, derived from the
+    # per-step blocks before they are flattened away.
+    node_depths = (
+        draft_node_depths(score_list) if proxy_temperatures is not None else None
+    )
     # b, n, topk; n = 1 + (num_steps-1) * topk
     score_list = torch.cat(score_list, dim=1).flatten(1)
     # b, (topk + (num_steps-1) * topk)
     ss_token_list = torch.cat(token_list, dim=1)
-    top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
+    # Prune the dynamic draft tree on a temperature-gated proxy score decoupled
+    # from the verification probability, so stochastic (T>0) drafting keeps
+    # diverse branches instead of collapsing toward the greedy chain. Only node
+    # *selection* changes here; the tokens (and therefore verification) are
+    # untouched, so decoding stays lossless.
+    prune_scores = score_list
+    if proxy_temperatures is not None:
+        prune_scores = temperature_proxy_scores(
+            score_list, proxy_temperatures, node_depths
+        )
+    top_scores = torch.topk(prune_scores, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
     top_scores_index = torch.sort(top_scores_index).values
     maybe_detect_oob(
