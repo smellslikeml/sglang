@@ -85,6 +85,7 @@ observed_landing_zones:
   last_observed: '2026-09-19T06:25:07Z'
 - path: python/sglang/srt/mem_cache/sparsity/algorithms/
   shape_tags:
+  - library-shape-public-api
   - registry-add
   confirmed_by:
   - arxiv: 2405.12532v2
@@ -101,7 +102,14 @@ observed_landing_zones:
       config `algorithm == 'hierarchica
     branch: random-long-context-access-for-mamba-via-hardware-aligned-hi
     timestamp: '2026-09-21T06:25:12Z'
-  last_observed: '2026-09-21T06:25:12Z'
+  - arxiv: 2503.10714v3
+    mode: Mode 2 (adapted port)
+    call_site_specifics: "python/sglang/srt/mem_cache/sparsity/factory.py \u2014 `_ALGORITHM_REGISTRY[\"\
+      accum_attention\"]`, dispatched by `_create_sparse_algorithm` \u2192 `create_sparse_coordinator`;\
+      \ also exported from `algorithms/__ini"
+    branch: zsmerge-zero-shot-kv-cache-compression-for-memory-efficient-
+    timestamp: '2026-09-23T06:26:53Z'
+  last_observed: '2026-09-23T06:26:53Z'
 rejected_shapes:
 - shape_tag: null
   reason_code: null
@@ -110,4 +118,4 @@ rejected_shapes:
   - arxiv: 2402.10076v1
     timestamp: '2026-09-18T06:16:35Z'
 coordination_signals: []
-last_updated: '2026-09-22T06:24:13Z'
+last_updated: '2026-09-23T06:26:53Z'
