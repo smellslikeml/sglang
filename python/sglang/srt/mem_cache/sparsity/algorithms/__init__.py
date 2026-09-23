@@ -1,3 +1,6 @@
+from sglang.srt.mem_cache.sparsity.algorithms.accum_attention_algorithm import (
+    AccumAttentionAlgorithm,
+)
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
     BaseSparseAlgorithm,
     BaseSparseAlgorithmImpl,
@@ -6,6 +9,7 @@ from sglang.srt.mem_cache.sparsity.algorithms.deepseek_dsa import DeepSeekDSAAlg
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
 
 __all__ = [
+    "AccumAttentionAlgorithm",
     "BaseSparseAlgorithm",
     "BaseSparseAlgorithmImpl",
     "DeepSeekDSAAlgorithm",

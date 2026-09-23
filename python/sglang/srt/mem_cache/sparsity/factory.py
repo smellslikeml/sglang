@@ -4,6 +4,9 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.mem_cache.sparsity.algorithms.accum_attention_algorithm import (
+    AccumAttentionAlgorithm,
+)
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_dsa import DeepSeekDSAAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
@@ -23,6 +26,9 @@ _global_sparse_coordinator: Optional[SparseCoordinator] = None
 _ALGORITHM_REGISTRY = {
     "quest": lambda config, device, **kw: QuestAlgorithm(config, device, **kw),
     "deepseek_dsa": lambda config, device, **kw: DeepSeekDSAAlgorithm(
+        config, device, **kw
+    ),
+    "accum_attention": lambda config, device, **kw: AccumAttentionAlgorithm(
         config, device, **kw
     ),
 }
