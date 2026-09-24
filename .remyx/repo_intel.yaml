@@ -110,6 +110,18 @@ observed_landing_zones:
     branch: zsmerge-zero-shot-kv-cache-compression-for-memory-efficient-
     timestamp: '2026-09-23T06:26:53Z'
   last_observed: '2026-09-23T06:26:53Z'
+- path: python/sglang/srt/mem_cache/sparsity/
+  shape_tags:
+  - registry-add
+  confirmed_by:
+  - arxiv: 2410.23079v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: python/sglang/srt/mem_cache/sparsity/factory.py `_ALGORITHM_REGISTRY["segmented_heavy_hitter"]`,
+      dispatched by `_create_sparse_algorithm` inside `create_sparse_coordinator`
+      (config field `algorithm`),
+    branch: buzz-beehive-structured-sparse-kv-cache-with-segmented-heavy
+    timestamp: '2026-09-24T06:23:51Z'
+  last_observed: '2026-09-24T06:23:51Z'
 rejected_shapes:
 - shape_tag: null
   reason_code: null
@@ -118,4 +130,4 @@ rejected_shapes:
   - arxiv: 2402.10076v1
     timestamp: '2026-09-18T06:16:35Z'
 coordination_signals: []
-last_updated: '2026-09-23T06:26:53Z'
+last_updated: '2026-09-24T06:23:51Z'
