@@ -12,6 +12,8 @@ import math
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from sglang.srt.environ import envs
+from sglang.srt.speculative.dynamic_draft_length import DraftConfidenceTracker
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -162,6 +164,25 @@ class AdaptiveStepSlot:
         self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
         self.ceiling_coeff = cfg.get("ceiling_coeff", 0)
 
+        # DynaSD (arXiv:2409.10644) confidence ceiling. When enabled, drafts are
+        # only extended while the cumulative per-position acceptance confidence
+        # stays above this threshold; see dynamic_draft_length. Disabled at 0.
+        # Gated default-off behind SGLANG_ENABLE_DYNASD_CONFIDENCE_CEILING so the
+        # config's confidence_threshold is only honored when explicitly opted in.
+        self.confidence_threshold = (
+            cfg.get("confidence_threshold", 0.0)
+            if envs.SGLANG_ENABLE_DYNASD_CONFIDENCE_CEILING.get()
+            else 0.0
+        )
+        self._confidence = (
+            DraftConfidenceTracker(
+                num_positions=max(self.candidate_steps),
+                ema_alpha=self.ema_alpha,
+            )
+            if self.confidence_threshold > 0.0
+            else None
+        )
+
         if initial_steps in self.candidate_steps:
             self.current_steps = initial_steps
         else:
@@ -187,6 +208,9 @@ class AdaptiveStepSlot:
             self.ema_accept_len = (
                 1 - self.ema_alpha
             ) * self.ema_accept_len + self.ema_alpha * batch_avg
+
+        if self._confidence is not None:
+            self._confidence.update(num_correct_drafts_per_req)
 
         self._batch_count += 1
         if self._batch_count <= self.warmup_batches:
@@ -244,6 +268,14 @@ class AdaptiveStepSlot:
                 while current_idx > 0 and self.candidate_steps[current_idx] > ceiling:
                     current_idx -= 1
                 target = self.candidate_steps[current_idx]
+
+        # DynaSD confidence ceiling: cap the draft length at the number of
+        # positions whose cumulative acceptance confidence clears the threshold.
+        if self._confidence is not None:
+            cap = self._confidence.implied_length(self.confidence_threshold)
+            while current_idx > 0 and self.candidate_steps[current_idx] > cap:
+                current_idx -= 1
+            target = self.candidate_steps[current_idx]
 
         return self._apply_target_steps(old_steps, target)
 
